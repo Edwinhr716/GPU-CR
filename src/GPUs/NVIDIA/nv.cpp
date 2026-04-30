@@ -60,7 +60,7 @@ void nv::ensureCudaInitialized() {
     CU_CHECK(cuCtxGetCurrent(&context_));
     if (context_ == nullptr) {
         CU_CHECK(cuDeviceGet(&device_, 0));
-        CU_CHECK(cuCtxCreate(&context_, 0, device_));
+        CU_CHECK(cuDevicePrimaryCtxRetain(&context_, device_));
         fprintf(stderr, "[NVIDIA] Created CUDA context on device %d\n", device_);
     } else {
         CU_CHECK(cuCtxGetDevice(&device_));
@@ -306,7 +306,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 fprintf(stderr, "[HOOK] cuDeviceGet failed: %s\n", errorStr);
                 return cudaErrorInitializationError;
             }
-            res = cuCtxCreate(&context, 0, device);
+            res = cuDevicePrimaryCtxRetain(&context, device);
             if (res != CUDA_SUCCESS) {
                 const char* errorStr;
                 cuGetErrorString(res, &errorStr);
