@@ -9,7 +9,9 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 def main():
     # Create an LLM.
-    llm = LLM(model="/mnt/data/lyy/Llama-8B", enforce_eager=True)
+    import os
+    model = os.environ.get("VLLM_MODEL", "/path/to/your/model")
+    llm = LLM(model=model, enforce_eager=True)
     
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_socket.bind(('0.0.0.0', 10000))

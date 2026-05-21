@@ -1,7 +1,7 @@
 export CUDA_VISIBLE_DEVICES=""
 export HIP_VISIBLE_DEVICES=0
 export GPU_VENDOR=AMD
-export VLLM_Model=/home/lyy/venv_py/model/Phi-4-mini-instruct
+export VLLM_Model="${VLLM_MODEL:-/path/to/your/model}"
 
 echo "Starting vLLM API Server..."
 echo "Current Shell PID: $$ (This will become the Python PID)"

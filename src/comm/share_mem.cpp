@@ -27,8 +27,10 @@ ShareMemComm::~ShareMemComm() {
 }
 
 void ShareMemComm::setup() {
-    char control_name[40];
-    sprintf(control_name, "/mnt/huge-ckpt/control-%d", pid);
+    char control_name[512];
+    const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
+    if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
+    snprintf(control_name, sizeof(control_name), "%s/control-%d", ctl_dir, pid);
     int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);
     if (fd_control < 0) {
         perror("open()");
