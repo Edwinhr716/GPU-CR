@@ -83,8 +83,12 @@ void ShareMem::setup() {
     fs_mutex.unlock();
 
 
-    // host_buf
-    sprintf(shm_name, "/mnt/huge-ckpt/%d-host", id);
+    // host_buf — follow same backend selection as the main staging buffer.
+    if (use_file_backend) {
+        snprintf(shm_name, sizeof(shm_name), "%s/ckpt-%d-host.data", export_file_path, id);
+    } else {
+        snprintf(shm_name, sizeof(shm_name), "/mnt/huge-ckpt/%d-host", id);
+    }
     fd_host = open(shm_name, O_CREAT | O_RDWR, 0755);
     if (fd_host < 0) {
         perror("open()");

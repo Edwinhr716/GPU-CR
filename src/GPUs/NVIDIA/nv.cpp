@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <iostream>
+#include <vector>
+#include <mutex>
+#include <set>
 
 // define global maps for memory tracking
 std::map<void*, size_t> allocated_memory;
@@ -12,6 +15,8 @@ std::map<void*, int> allocated_memory_type;  // 0=cudaMalloc, 1=VMM
 
 // Global handle map for all VMM allocations (both from hook and nv::allocate)
 static std::map<void*, CUmemGenericAllocationHandle> global_handle_map;
+
+// P2P peer access hooks and helpers live in src/ipc_hooks.cpp (canonical).
 
 typedef cudaError_t (*cudaMalloc_func_t)(void**, size_t);
 typedef cudaError_t (*cudaFree_func_t)(void*);
@@ -424,6 +429,10 @@ extern "C" cudaError_t cudaFree(void* ptr) {
     allocated_memory.erase(it);
     fprintf(stderr, "[HOOK] cudaFree completed\n");
     fflush(stderr);
-    
+
     return cudaSuccess;
-} 
+}
+
+// P2P peer access hooks (cudaDeviceEnablePeerAccess / cudaDeviceDisablePeerAccess)
+// and the disable/reenable helpers used by vGPU.cpp are defined in
+// src/ipc_hooks.cpp (canonical), to keep IPC + P2P state in one place.

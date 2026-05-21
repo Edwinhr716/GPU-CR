@@ -18,6 +18,20 @@
 #include "comm/comm.h"
 #include "backend/backend.h"
 #include "GPUs/GPU.h"
+#include "nccl_hooks.h"
+
+// IPC hooks for cuMem IPC management (defined in ipc_hooks.cpp).
+// On NVIDIA this header also declares ipc_disable_all_peer_access /
+// ipc_reenable_all_peer_access, the canonical P2P teardown helpers.
+#include "ipc_hooks.h"
+// UDS fd exchange for cross-process CUDA handle transfer (defined in ipc_fd_exchange.cpp)
+#include "ipc_fd_exchange.h"
+
+// Buffer for saving IPC export GPU data between teardown and rebuild phases
+static void*  g_ipc_export_data_buf  = nullptr;
+static size_t g_ipc_export_data_size = 0;
+static void*  g_local_alloc_data_buf  = nullptr;
+static size_t g_local_alloc_data_size = 0;
 
 std::mutex fs_mutex;
 Comm *comm;
@@ -324,8 +338,11 @@ double restore_ptr_and_content() {
 }
 
 int get_id() {
-    char id_name[40];
-    int fd_id = open("/mnt/huge-ckpt/control", O_CREAT | O_RDWR, 0755);
+    char id_name[512];
+    const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
+    if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
+    snprintf(id_name, sizeof(id_name), "%s/control", ctl_dir);
+    int fd_id = open(id_name, O_CREAT | O_RDWR, 0755);
     if (fd_id < 0) {
         perror("open()");
         exit(EXIT_FAILURE);
@@ -423,31 +440,311 @@ void cr_signal_handler(int signum) {
         double tot_size = ckpt();
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        fprintf(stderr, "ckpt size: %f GB, time: %ld ms, bw: %f GB/s\n", 
-               tot_size / 1024 / 1024 / 1024, duration.count(), 
+        fprintf(stderr, "ckpt size: %f GB, time: %ld ms, bw: %f GB/s\n",
+               tot_size / 1024 / 1024 / 1024, duration.count(),
                tot_size / duration.count() * 1000 / 1024 / 1024 / 1024);
-        
-        // Note: External checkpoint (cuda-checkpoint for NVIDIA, CRIU for AMD) 
+
+        // Disable P2P peer access before cuda-checkpoint freeze.
+        // P2P access creates driver-level state that cuda-checkpoint cannot restore.
+        // This must happen AFTER ckpt() (data is saved) and BEFORE cuda-checkpoint runs.
+#if !defined(__HIP_PLATFORM_AMD__)
+        fprintf(stderr, "[vGPU] Disabling P2P peer access for cuda-checkpoint...\n");
+        ipc_disable_all_peer_access();
+#endif
+        // Note: External checkpoint (cuda-checkpoint for NVIDIA, CRIU for AMD)
         // is called from cr_client, not here
     } else if (msg == RESTORE_MSG) {
+        // Note: cuda-checkpoint restore was already called by cr_client before this signal
         fprintf(stderr, "start restore...\n");
         auto start = std::chrono::high_resolution_clock::now();
         double tot_size = restore_ptr_and_content();
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        fprintf(stderr, "restore size: %f GB, time: %ld ms, bw: %f GB/s\n", 
-               tot_size / 1024 / 1024 / 1024, duration.count(), 
+        fprintf(stderr, "restore size: %f GB, time: %ld ms, bw: %f GB/s\n",
+               tot_size / 1024 / 1024 / 1024, duration.count(),
                tot_size / duration.count() * 1000 / 1024 / 1024 / 1024);
+
+        // Re-enable P2P peer access after data restore
+#if !defined(__HIP_PLATFORM_AMD__)
+        fprintf(stderr, "[vGPU] Re-enabling P2P peer access after restore...\n");
+        ipc_reenable_all_peer_access();
+#endif
         fprintf(stderr, "finish restore\n");
     }
     comm->send_msg(FINISH_MSG);
 }
 
+// ---------------------------------------------------------------------------
+// IPC teardown/rebuild signal handler (for multi-GPU checkpoint/restore)
+// Replaces the old NCCL suspend/resume handler — no NCCL source mods needed.
+// ---------------------------------------------------------------------------
+void cr_ipc_signal_handler(int signum) {
+    fprintf(stderr, "[vGPU-IPC] Received signal %d (PID=%d)\n", signum, getpid());
+    fflush(stderr);
+
+    if (!CR_initialized) {
+        fprintf(stderr, "[vGPU-IPC] CR not initialized, initializing now...\n");
+        init_CR();
+    }
+
+    uint32_t msg = comm->recv_msg();
+
+    if (msg == IPC_TEARDOWN_MSG) {
+        // === Checkpoint Phase 1: Teardown IPC state ===
+        fprintf(stderr, "[vGPU-IPC] === IPC Teardown Phase === (imports=%d, exports=%d, events=%d)\n",
+                ipc_get_import_count(), ipc_get_export_count(), ipc_get_event_count());
+        fflush(stderr);
+
+        auto t_phase_start = std::chrono::high_resolution_clock::now();
+
+        // GPU sync
+        fprintf(stderr, "[vGPU-IPC] Synchronizing GPU (waiting for in-flight kernels)...\n");
+        gpu->syncAllKernels();
+        auto t_sync = std::chrono::high_resolution_clock::now();
+        auto sync_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_sync - t_phase_start).count();
+        fprintf(stderr, "[vGPU-IPC] GPU synchronized (%ld ms)\n", sync_ms);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // Diagnostic: dump IPC state and nvidia fds BEFORE teardown
+        ipc_dump_state();
+        ipc_dump_nvidia_fds("BEFORE teardown");
+
+        // Teardown all imported IPC mappings (cuMemUnmap + cuMemRelease)
+        auto t_imports = std::chrono::high_resolution_clock::now();
+        int torn = ipc_teardown_all_imports();
+        auto t_imports_end = std::chrono::high_resolution_clock::now();
+        auto imports_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_imports_end - t_imports).count();
+        fprintf(stderr, "[vGPU-IPC] Torn down %d IPC imports (%ld ms)\n", torn, imports_ms);
+
+        // Save export GPU data to host buffer, then fully teardown exports
+        size_t export_data_needed = ipc_get_export_data_size();
+        fprintf(stderr, "[vGPU-IPC] Export data size needed: %zu bytes\n", export_data_needed);
+
+        if (export_data_needed > 0) {
+            if (g_ipc_export_data_buf) {
+                munmap(g_ipc_export_data_buf, g_ipc_export_data_size);
+                g_ipc_export_data_buf = nullptr;
+            }
+            g_ipc_export_data_size = export_data_needed;
+            g_ipc_export_data_buf = mmap(nullptr, g_ipc_export_data_size,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (g_ipc_export_data_buf == MAP_FAILED) {
+                fprintf(stderr, "[vGPU-IPC] ERROR: mmap for export data buffer failed\n");
+                g_ipc_export_data_buf = nullptr;
+                g_ipc_export_data_size = 0;
+            }
+        }
+
+        auto t_exports = std::chrono::high_resolution_clock::now();
+        int export_torn = 0;
+        if (g_ipc_export_data_buf && g_ipc_export_data_size > 0) {
+            export_torn = ipc_save_and_teardown_all_exports(
+                g_ipc_export_data_buf, g_ipc_export_data_size);
+            fprintf(stderr, "[vGPU-IPC] Export save+teardown: %d exports processed\n", export_torn);
+        } else if (export_data_needed == 0) {
+            fprintf(stderr, "[vGPU-IPC] No export data to save (0 mapped exports)\n");
+        }
+        auto t_exports_end = std::chrono::high_resolution_clock::now();
+        auto exports_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_exports_end - t_exports).count();
+        fprintf(stderr, "[vGPU-IPC] Export teardown total: %ld ms\n", exports_ms);
+
+        // Teardown IPC events
+        auto t_events = std::chrono::high_resolution_clock::now();
+        int events_torn = ipc_teardown_all_events();
+        auto t_events_end = std::chrono::high_resolution_clock::now();
+        auto events_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_events_end - t_events).count();
+        fprintf(stderr, "[vGPU-IPC] IPC events torn down: %d (%ld ms)\n", events_torn, events_ms);
+
+        // Teardown non-exported cuMem allocs
+        size_t local_alloc_needed = ipc_get_local_alloc_data_size();
+        fprintf(stderr, "[vGPU-IPC] Local cuMem alloc data size: %zu bytes\n", local_alloc_needed);
+
+        if (local_alloc_needed > 0) {
+            if (g_local_alloc_data_buf) {
+                munmap(g_local_alloc_data_buf, g_local_alloc_data_size);
+                g_local_alloc_data_buf = nullptr;
+            }
+            g_local_alloc_data_size = local_alloc_needed;
+            g_local_alloc_data_buf = mmap(nullptr, g_local_alloc_data_size,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (g_local_alloc_data_buf == MAP_FAILED) {
+                fprintf(stderr, "[vGPU-IPC] ERROR: mmap for local alloc buffer failed\n");
+                g_local_alloc_data_buf = nullptr;
+                g_local_alloc_data_size = 0;
+            }
+        }
+
+        auto t_local = std::chrono::high_resolution_clock::now();
+        if (g_local_alloc_data_buf && g_local_alloc_data_size > 0) {
+            int local_torn = ipc_save_and_teardown_local_allocs(
+                g_local_alloc_data_buf, g_local_alloc_data_size);
+            fprintf(stderr, "[vGPU-IPC] Local alloc save+teardown: %d allocs processed\n", local_torn);
+        } else if (local_alloc_needed == 0) {
+            fprintf(stderr, "[vGPU-IPC] No local cuMem allocs to teardown\n");
+        }
+        auto t_local_end = std::chrono::high_resolution_clock::now();
+        auto local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_local_end - t_local).count();
+        fprintf(stderr, "[vGPU-IPC] Local alloc teardown total: %ld ms\n", local_ms);
+
+        // Diagnostic: dump nvidia fds AFTER teardown
+        ipc_dump_nvidia_fds("AFTER teardown");
+
+        // Disable P2P peer access
+#if !defined(__HIP_PLATFORM_AMD__)
+        auto t_p2p = std::chrono::high_resolution_clock::now();
+        ipc_disable_all_peer_access();
+        auto t_p2p_end = std::chrono::high_resolution_clock::now();
+        auto p2p_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_p2p_end - t_p2p).count();
+        fprintf(stderr, "[vGPU-IPC] P2P peer access disabled (%ld ms)\n", p2p_ms);
+#endif
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t_phase_start).count();
+        fprintf(stderr, "[vGPU-IPC] IPC teardown completed in %ld ms (excl. GPU sync)\n", ms);
+        fprintf(stderr, "[vGPU-IPC] === Teardown Timing Summary: GPU-sync=%ld, Imports=%ld, Exports=%ld, Events=%ld, LocalAllocs=%ld, Total=%ld ms ===\n",
+                sync_ms, imports_ms, exports_ms, events_ms, local_ms, total_ms);
+
+    } else if (msg == IPC_EXPORT_MSG) {
+        // === Restore Phase 3a: Re-export and publish handle info ===
+        fprintf(stderr, "[vGPU-IPC] === IPC Re-export Phase ===\n");
+        fflush(stderr);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // Rebuild export allocations at original VAs, restore GPU data, re-export
+        auto t_exports = std::chrono::high_resolution_clock::now();
+        int rebuilt = 0;
+        if (g_ipc_export_data_buf && g_ipc_export_data_size > 0) {
+            rebuilt = ipc_rebuild_and_restore_all_exports(
+                g_ipc_export_data_buf, g_ipc_export_data_size);
+            fprintf(stderr, "[vGPU-IPC] Rebuilt+restored %d export allocations\n", rebuilt);
+
+            munmap(g_ipc_export_data_buf, g_ipc_export_data_size);
+            g_ipc_export_data_buf = nullptr;
+            g_ipc_export_data_size = 0;
+        } else {
+            fprintf(stderr, "[vGPU-IPC] No export data to restore (buffer empty)\n");
+        }
+        auto t_exports_end = std::chrono::high_resolution_clock::now();
+        auto exports_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_exports_end - t_exports).count();
+
+        // Rebuild non-exported cuMem allocs
+        auto t_local = std::chrono::high_resolution_clock::now();
+        if (g_local_alloc_data_buf && g_local_alloc_data_size > 0) {
+            int local_rebuilt = ipc_rebuild_local_allocs(
+                g_local_alloc_data_buf, g_local_alloc_data_size);
+            fprintf(stderr, "[vGPU-IPC] Rebuilt %d local cuMem allocs\n", local_rebuilt);
+
+            munmap(g_local_alloc_data_buf, g_local_alloc_data_size);
+            g_local_alloc_data_buf = nullptr;
+            g_local_alloc_data_size = 0;
+        }
+        auto t_local_end = std::chrono::high_resolution_clock::now();
+        auto local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_local_end - t_local).count();
+
+        // Write export info to shared memory for peers to read
+        auto t_shm = std::chrono::high_resolution_clock::now();
+        void* tmp_buf = backend->get_tmp_buf();
+        shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
+        IpcRebuildShmBlock* my_block = (IpcRebuildShmBlock*)((char*)tmp_buf +
+            ROUND_UP_2MB(sizeof(shared_mem_fs)) - sizeof(IpcRebuildShmBlock));
+        ipc_write_export_info_to_shm(my_block);
+        auto t_shm_end = std::chrono::high_resolution_clock::now();
+        auto shm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_shm_end - t_shm).count();
+
+        // Start UDS fd server
+        auto t_uds = std::chrono::high_resolution_clock::now();
+        uds_fd_server_start();
+        auto t_uds_end = std::chrono::high_resolution_clock::now();
+        auto uds_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_uds_end - t_uds).count();
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        fprintf(stderr, "[vGPU-IPC] IPC re-export completed in %ld ms\n", ms);
+        fprintf(stderr, "[vGPU-IPC] === Re-export Timing Summary: Exports=%ld, LocalAllocs=%ld, SHM-write=%ld, UDS-server=%ld, Total=%ld ms ===\n",
+                exports_ms, local_ms, shm_ms, uds_ms, ms);
+
+    } else if (msg == IPC_IMPORT_MSG) {
+        // === Restore Phase 3b: Import from peers ===
+        fprintf(stderr, "[vGPU-IPC] === IPC Re-import Phase ===\n");
+        fflush(stderr);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        void* tmp_buf = backend->get_tmp_buf();
+        IpcRebuildShmBlock* peer_block = (IpcRebuildShmBlock*)((char*)tmp_buf +
+            ROUND_UP_2MB(sizeof(shared_mem_fs)) - sizeof(IpcRebuildShmBlock) * 2);
+
+        auto t_import = std::chrono::high_resolution_clock::now();
+        if (peer_block->num_exports > 0) {
+            int imported = ipc_import_from_shm_block(peer_block);
+            fprintf(stderr, "[vGPU-IPC] Imported %d mappings from peers\n", imported);
+        } else {
+            fprintf(stderr, "[vGPU-IPC] No peer exports to import\n");
+        }
+        auto t_import_end = std::chrono::high_resolution_clock::now();
+        auto import_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_import_end - t_import).count();
+
+        // Stop UDS fd server
+        auto t_uds_stop = std::chrono::high_resolution_clock::now();
+        uds_fd_server_stop();
+        auto t_uds_stop_end = std::chrono::high_resolution_clock::now();
+        auto uds_stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_uds_stop_end - t_uds_stop).count();
+
+        // Validate all IPC mappings after rebuild
+        auto t_validate = std::chrono::high_resolution_clock::now();
+        ipc_validate_all_mappings("AFTER import rebuild");
+        auto t_validate_end = std::chrono::high_resolution_clock::now();
+        auto validate_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_validate_end - t_validate).count();
+
+        // Re-enable P2P peer access
+#if !defined(__HIP_PLATFORM_AMD__)
+        auto t_p2p = std::chrono::high_resolution_clock::now();
+        ipc_reenable_all_peer_access();
+        auto t_p2p_end = std::chrono::high_resolution_clock::now();
+        auto p2p_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_p2p_end - t_p2p).count();
+#else
+        long p2p_ms = 0;
+#endif
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        fprintf(stderr, "[vGPU-IPC] IPC re-import completed in %ld ms\n", ms);
+        fprintf(stderr, "[vGPU-IPC] === Re-import Timing Summary: Import=%ld, UDS-stop=%ld, Validate=%ld, P2P=%ld, Total=%ld ms ===\n",
+                import_ms, uds_stop_ms, validate_ms, p2p_ms, ms);
+
+    } else {
+        fprintf(stderr, "[vGPU-IPC] WARNING: unexpected message %u\n", msg);
+    }
+
+    comm->send_msg(FINISH_MSG);
+    fflush(stderr);
+}
+
+// ---------------------------------------------------------------------------
+// Library constructor: register all signal handlers
+// ---------------------------------------------------------------------------
 __attribute__((constructor)) void init() {
     fprintf(stderr, "[vGPU] Library loaded! Registering signal handlers...\n");
+    fprintf(stderr, "[vGPU] Multi-GPU CR support enabled (IPC hook mode)\n");
     fflush(stderr);
-    
+
+    // Original single-GPU signals
     signal(CR_INIT_SIGNAL, cr_signal_handler);
     signal(CR_CKPT_SIGNAL, cr_signal_handler);
     signal(CR_RESTORE_SIGNAL, cr_signal_handler);
+
+    // Multi-GPU IPC teardown/rebuild signals (replaces NCCL suspend/resume)
+    signal(CR_IPC_TEARDOWN_SIGNAL, cr_ipc_signal_handler);
+    signal(CR_IPC_REBUILD_SIGNAL, cr_ipc_signal_handler);
+
+    // Diagnostic: validate all IPC mappings on demand
+    signal(CR_IPC_VALIDATE_SIGNAL, [](int) {
+        ipc_validate_all_mappings("ON-DEMAND");
+        fflush(stderr);
+    });
 }

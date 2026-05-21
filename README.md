@@ -6,27 +6,43 @@
 
 <div align=center><img width = '150' height ='150' src ="./source/GPU-CR.png"/></div>
 
-GPU-CR is a system designed to support efficient Checkpoint and Restore (C/R) for GPU-accelerated applications. Its key advantage is completely yielding the GPU memory of the checkpointed app (reducing VRAM usage to 0), seamlessly freeing up space for other workloads to swap in and execute.
+GPU-CR is a system designed to support efficient Checkpoint and Restore (C/R)
+for GPU-accelerated applications. Its key advantage is completely yielding the
+GPU memory of the checkpointed app (reducing VRAM usage to 0), seamlessly
+freeing up space for other workloads to swap in and execute.
 
 ![CLI Demonstration](./source/GPUCR_VS_CUDA.gif)
 <p align="center">
-  <em>A quick demonstration of executing the GPU-CR tool via the command-line interface.</em>
+  <em>Single-GPU CLI demonstration of the GPU-CR tool.</em>
 </p>
+
+
+## News
+
+- **[2026-05]** Multi-GPU C/R lands on NVIDIA: phased `multi_cr_client`
+  orchestrator, NCCL plugin adapter, zero-patch NVSHMEM examples, and a 4-model multi-GPU vLLM
+  benchmark — see §II.3.
+- **[2026-03]** Initial single-GPU release for **NVIDIA (CUDA)** and
+  **AMD (ROCm)** — transparent `LD_PRELOAD` interception, `cr_client` CLI,
+  hugepage-accelerated VRAM staging.
 
 
 ## I. Features
 
-- **Cross-Vendor Support**: Experimental support for both NVIDIA and AMD GPUs.
-- **Transparent C/R**: Uses `LD_PRELOAD` to inject a `vGPU` library that intercepts memory allocations and resource management.
-- **Client CLI**: Simple command-line interface (`cr_client`) to trigger checkpoint and restore operations.
-- **Performance Optimization**: Support for Huge Pages to accelerate memory saving.
+- **Cross-Vendor Support**: NVIDIA (CUDA) and AMD (ROCm), single-GPU.
+- **Multi-GPU C/R (NVIDIA)**: Phased multi-process orchestrator
+  (`multi_cr_client`), cuMem IPC/VMM teardown, optional
+  [NCCL adapter](adapters/nccl/README.md) and
+  [NVSHMEM examples](adapters/nvshmem/README.md).
+- **Transparent C/R**: `LD_PRELOAD` injects a `vGPU` library that intercepts
+  memory allocations and resource management — no application changes for the
+  single-GPU and signal-driven multi-GPU paths.
+- **Client CLI**: `cr_client` (single-GPU) and `multi_cr_client` (multi-GPU)
+  trigger checkpoint and restore operations.
+- **Performance Optimization**: Huge Pages support to accelerate VRAM staging.
 
-## II. TODO
 
-We are actively working on expanding GPU-CR's capabilities:
-- 🚀 **Broader Hardware Support**: Extending compatibility to more architectures, such as Huawei Ascend.
-
-## III. Performance Evaluation
+## II. Performance Evaluation
 
 We compare GPU-CR with existing GPU checkpoint solutions on four LLM workloads:
 
@@ -42,146 +58,200 @@ For GPU-CR, the latency is split into:
 
 Total latency = Data + Control
 
-### 1.NVIDIA (CUDA Checkpoint vs GPU-CR)
+### 1. NVIDIA Single-GPU (CUDA Checkpoint vs GPU-CR)
 - **GPU:** NVIDIA A100-PCIE-40GB
-- **Driver Version:** 580.95.05      
+- **Driver Version:** 580.95.05
 - **CUDA Version:** 13.0
 - **vLLM Version:** 0.14.1
 
-![Performance Comparison](./source/gpu-cr_cuda.png "NVIDIA (CUDA Checkpoint vs GPU-CR")
+![Performance Comparison](./source/gpu-cr_cuda.png "NVIDIA (CUDA Checkpoint vs GPU-CR)")
 
-### 2.AMD (CRIU vs GPU-CR)
+### 2. AMD Single-GPU (CRIU vs GPU-CR)
 - **GPU:** AMD Instinct MI100
 - **ROCm Version:** 6.4.3
 - **vLLM Version:** 0.11.1-rc7
+
 ![Performance Comparison](./source/gpu-cr_criu_amd.png "AMD (CRIU vs GPU-CR)")
 
+### 3. NVIDIA Multi-GPU (vLLM TP=1 PP=2, gpu_util=0.9)
 
-## IV. Prerequisites
+- **GPUs:** 2 × NVIDIA A100-PCIE-40GB
+- **Driver Version:** 580.95.05
+- **CUDA Version:** 12.9
+- **vLLM Version:** 0.14.1
 
-- **Operating System**: Linux (Tested on Ubuntu 22.04).
-- **Build Tools**: CMake, GCC/G++, Make.
+![Multi-GPU Performance](./source/gpu-cr_cuda_multi_gpu.png "NVIDIA Multi-GPU (vLLM TP=1 PP=2, gpu_util=0.9)")
+
+Times are dominated by the per-worker data plane (≈ 36 GiB GPU→host copy
+during checkpoint, host→GPU during restore), so they barely depend on the
+model — at `gpu_memory_utilization=0.9` vLLM fills the KV cache to roughly
+the same size regardless of weight count.
+
+> **Reproducing**: build with `-DSHM_SIZE_GB=40` (otherwise the default
+> 25 GiB staging ceiling is hit when each worker dumps ≈ 36 GiB), reserve
+> ≥ 45000 2 M hugepages (`echo 45056 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages`),
+> mount `/mnt/huge-ckpt` with `size=88G`, then run
+> `apps/vllm/launch_multi_gpu.sh` after `export VLLM_GPU_UTIL=0.9`.
+
+
+## III. Prerequisites
+
+- **Operating System**: Linux (tested on Ubuntu 22.04).
+- **Build Tools**: CMake ≥ 3.18, GCC/G++, Make.
 - **Checkpoint Backend & Drivers**:
-  - **NVIDIA**: 
-    - Requires CUDA Toolkit 12.x or later.
-    - Uses `cuda-checkpoint` (**Included in this repository**). 
-    - *Note: If updates are needed, please update the parameters within the source code manually.*[[cuda-checkpoint]](https://github.com/NVIDIA/cuda-checkpoint)
-  - **AMD**: 
-    - Requires ROCm 6.x or later.
-    - Requires a custom-built `criu` with the AMD plugin enabled. **(Manual Compilation Required)**. 
-    - *Note: This custom CRIU is not included in this repository. Users must manually compile and install CRIU with AMD plugin before using GPU-CR.*[[CRIU AMDGPU Plugin Documentation]](https://github.com/checkpoint-restore/criu/blob/criu-dev/plugins/amdgpu/README.md)
+  - **NVIDIA**:
+    - CUDA Toolkit 12.x or later.
+    - Uses `cuda-checkpoint` (**included in this repository**, under
+      `cuda-checkpoint/`).
+    - For the multi-GPU path: a recent driver supporting
+      `cuda-checkpoint --action`.
+    - For the NCCL adapter: an NCCL source tree (≥ 2.28 master) to patch
+      (`adapters/nccl/nccl_patches/`).
+    - For the NVSHMEM examples: an NVSHMEM install with header + libraries.
+  - **AMD**:
+    - ROCm 6.x or later.
+    - A custom-built `criu` with the AMD plugin enabled (manual compilation
+      required, not included in this repo).
+      See the [CRIU AMDGPU Plugin docs](https://github.com/checkpoint-restore/criu/blob/criu-dev/plugins/amdgpu/README.md).
 
-## V. Building
 
-This project utilizes CMake for building. **Please choose ONE of the following build options based on your target GPU vendor.** Do not build both simultaneously in the same environment.
+## IV. Building
 
-### Option 1: Build for NVIDIA (CUDA)
-```Bash
-mkdir build && cd build
-export GPU_VENDOR=NVIDIA
-cmake ..
-make -j$(nproc)
-```
-This generates `vGPU-NVIDIA.so` and `cr_client`.
+Pick **one** vendor per build directory.
 
-### Option 2: Build for AMD (ROCm)
-
+### Option 1: NVIDIA (CUDA)
 ```bash
 mkdir build && cd build
-export GPU_VENDOR=AMD
-cmake ..
+cmake -DGPU_VENDOR=NVIDIA ..
 make -j$(nproc)
+# Outputs: vGPU-NVIDIA.so, cr_client, multi_cr_client
 ```
-This generates `vGPU-AMD.so` and `cr_client`.
 
-## VI. Usage
+### Option 2: AMD (ROCm)
+```bash
+mkdir build && cd build
+cmake -DGPU_VENDOR=AMD ..
+make -j$(nproc)
+# Outputs: vGPU-AMD.so, cr_client
+```
 
-### 1. Environment Configuration
-Before running, configure the necessary environment variables.
+### Option 3: NVIDIA + NCCL adapter
+```bash
+mkdir build && cd build
+cmake -DGPU_VENDOR=NVIDIA \
+      -DGPU_CR_BUILD_NCCL_ADAPTER=ON \
+      -DNCCL_ROOT=/path/to/nccl ..
+make -j$(nproc)
+# Additional outputs:
+#   adapters/nccl/libgcr_preload.so
+#   adapters/nccl/libnccl-checkpoint-gcr.so
+#   adapters/nccl/two_proc_nccl_test
+```
 
-#### (1) General Configuration (Both NVIDIA & AMD)
-- VRAM Storage Strategy
-By default, GPU memory is saved to Huge Pages. You can optionally save it to a file system path using EXPORT_FILE_PATH.
+`-DGPU_CR_BUILD_NVSHMEM_ADAPTER=ON -DNVSHMEM_ROOT=/path/to/nvshmem` adds the
+NVSHMEM example binaries; the adapter ships no patch since the cuMem hooks
+already cover NVSHMEM.
 
-```Bash
-# Optional: Path to save video memory content as a file.
-# If NOT set, the system defaults to saving VRAM to Huge Pages.
+To run multi-GPU at `gpu_memory_utilization=0.9`, also pass
+`-DSHM_SIZE_GB=40` so the per-worker staging buffer fits the larger dump.
+
+
+## V. Usage
+
+### 1. Environment (single-GPU and multi-GPU)
+
+```bash
+# Optional: file-based VRAM staging (instead of hugepages)
 export EXPORT_FILE_PATH=/path/to/save/vram_dump_path
-```
 
-- Huge Pages (Recommended for Acceleration)
-Huge pages can significantly accelerate the save process for both vendors.
-
-```Bash
-# Example: reserve 80GB huge pages
-sudo bash -c "echo 40960 > /proc/sys/vm/nr_hugepages"
-
-sudo mkdir /mnt/huge-ckpt
+# Recommended for speed: reserve hugepages
+sudo bash -c 'echo 40960 > /proc/sys/vm/nr_hugepages'   # ~80 GiB
+sudo mkdir -p /mnt/huge-ckpt
 sudo mount -t hugetlbfs nodev /mnt/huge-ckpt
-sudo chmod 777 -R /mnt/huge-ckpt
-```
+sudo chmod 777 /mnt/huge-ckpt
 
-#### (2) AMD-Specific Configuration
-If you are using AMD GPUs, you must specify the directory where CRIU will store its checkpoint files.
-```Bash
+# AMD-specific: where CRIU writes its checkpoint files
 export AMD_CKPT_DIR=/path/to/save/criu_files
 ```
 
-### 2. Running an Application
-
-Launch the target application (e.g., a Python script using PyTorch/vLLM or a C++ binary) using `LD_PRELOAD`.
-
-**(1) Example (NVIDIA):**
-```bash
-LD_PRELOAD=/path/to/build/vGPU-NVIDIA.so python3 ./apps/vllm/serving_vllm_nvidia.py
-```
-
-**(2) Example (AMD):**
-```bash
-LD_PRELOAD=/path/to/build/vGPU-AMD.so ./apps/vllm/serving_vllm_amd.sh
-```
-
-### 3. Checkpointing
-
-Use the `cr_client` tool to trigger a checkpoint.
+### 2. Single-GPU run + checkpoint
 
 ```bash
-# -i: initialization mode
-# -c: Checkpoint mode
-# -p: Target PID
-# -m: (Optional) The PID of the original parent process (Master) that CRIU needs to control.(for CRIU in AMD mode)
-./cr_client -c -p <TARGET_PID>
-# or
-./cr_client -c -p <GPU_CHILD_PID> -m <PARENT_PID>
+# Run the app under the preloader
+LD_PRELOAD=$PWD/build/vGPU-NVIDIA.so python3 ./apps/vllm/serving_vllm_nvidia.py &
+APP_PID=$!
+
+# Checkpoint
+./build/cr_client -c -p $APP_PID
+
+# Restore
+./build/cr_client -r -p $APP_PID
 ```
 
-### 4. Restoring
+For AMD swap `vGPU-NVIDIA.so` → `vGPU-AMD.so` and add `-m <PARENT_PID>` to
+`cr_client` when CRIU needs the original parent.
 
-Restore the process from the checkpoints.
+### 3. Multi-GPU quick start (NVIDIA)
 
 ```bash
-# -r: Restore mode
-# -p: Target PID (the original PID)
-./cr_client -r -p <TARGET_PID>
+# Launch any multi-GPU app; the wrapper sets LD_PRELOAD + NCCL_CUMEM_ENABLE
+./apps/vllm/launch_multi_gpu.sh \
+    python -m vllm.entrypoints.openai.api_server \
+        --model /path/to/your/model \
+        --tensor-parallel-size 4 \
+        --enforce-eager &
+
+# Find the worker PIDs (one per GPU)
+PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | paste -sd,)
+
+# Initialize the C/R subsystem in every worker (one-time, after model load)
+./build/multi_cr_client -i -p $PIDS
+
+# Checkpoint (frees all GPU memory but keeps processes alive)
+./build/multi_cr_client -c -p $PIDS
+
+# … other workloads can now use the GPU …
+
+# Restore (workers resume serving exactly where they paused)
+./build/multi_cr_client -r -p $PIDS
 ```
 
-## VII. Directory Structure
 
-- `src/`: Source code for the vGPU library and cr_client.
-  - `GPUs/NVIDIA/`: NVIDIA-specific implementation (CUDA hooks).
-  - `GPUs/AMD/`: AMD-specific implementation (HIP hooks).
-  - `cr_client.cpp`: Control client implementation.
-- `apps/`: Example scripts and applications (e.g., vLLM examples).
+## VI. Directory Structure
 
-## VIII. Citation
+```
+GPU-CR/
+├── src/                         Core LD_PRELOAD library
+│   ├── vGPU.cpp                  signal handlers + C/R loop
+│   ├── ipc_hooks.cpp/h           cuMem IPC + peer-access interception
+│   ├── ipc_fd_exchange.cpp/h     UDS + SCM_RIGHTS fd exchange
+│   ├── nccl_hooks.cpp/h          NCCL communicator tracking
+│   ├── common.h                  signals, SHM constants
+│   ├── comm/                     SHM control channel
+│   ├── backend/                  staging-buffer backends
+│   └── GPUs/{NVIDIA,AMD,GPU.h,gpu_factory.cpp}
+├── coordinator/
+│   ├── cr_client.cpp             single-GPU CLI
+│   └── multi_cr_client.cpp       multi-GPU phased orchestrator
+├── adapters/
+│   ├── nccl/                     NCCL plugin + runtime + 3-file upstream patch
+│   └── nvshmem/                  NVSHMEM examples (no patch needed)
+├── apps/
+│   └── vllm/                     launch + serving scripts for vLLM
+├── cuda-checkpoint/              NVIDIA cuda-checkpoint binary (vendored)
+└── source/                       README assets (logo, perf charts, gif)
+```
 
-This project is based on our paper:
+
+## VII. Citation
+
+This project builds on the GCR:
 
 ```bibtex
 @inproceedings{GCR,
   author    = {Shaoxun Zeng and Tingxu Ren and Jiwu Shu and Youyou Lu},
   title     = {GPU Checkpoint/Restore Made Fast and Lightweight},
-  booktitle = {24rd USENIX Conference on File and Storage Technologies (FAST'26)},
+  booktitle = {24th USENIX Conference on File and Storage Technologies (FAST'26)},
   year      = {2026},
   address   = {Santa Clara, CA},
   month     = feb,
@@ -189,5 +259,3 @@ This project is based on our paper:
   url       = {https://www.usenix.org/conference/fast26/presentation/zeng}
 }
 ```
-
-And the implementation of the paper is in: https://github.com/thustorage/GCR

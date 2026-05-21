@@ -40,6 +40,7 @@ std::string get_cuda_checkpoint_path() {
     return full_path;
 }
 
+
 int main(int argc, char* argv[]) {
     int opt;
     int init = 0;
@@ -186,7 +187,6 @@ int main(int argc, char* argv[]) {
 
         printf("Process internal restoration finished.\n");
         printf("Restoring done\n");
-        
 #else
         std::string bin_path = get_cuda_checkpoint_path();
         std::string cmd = bin_path + " --toggle --pid " + std::to_string(pid);

@@ -1,1 +1,40 @@
-build
+# Build outputs
+build/
+build_*/
+cmake-build-*/
+out/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# Object files & libraries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs and benchmark results
+*.log
+bench/results/
+log/
