@@ -337,6 +337,16 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Make NCCL share P2P buffers via the cuMem* APIs that GPU-CR intercepts.
+  // Without this, NCCL uses legacy CUDA IPC (cudaIpcGetMemHandle): GPU-CR
+  // tracks nothing (`imports=0 exports=0`) and cuda-checkpoint fails to
+  // restore ("operation not supported").
+  // Deliberately NOT setting NCCL_P2P_DISABLE: the P2P transport is what
+  // produces the cuMem exports/imports this test exercises (GCR disables
+  // peer access itself before the process-level checkpoint).
+  // overwrite=0 keeps explicit user values.
+  setenv("NCCL_CUMEM_ENABLE", "1", 0);
+
   SharedState* shared = reinterpret_cast<SharedState*>(
       mmap(nullptr, sizeof(SharedState), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
   if (shared == MAP_FAILED) {
@@ -390,13 +400,16 @@ int main(int argc, char** argv) {
     parent_wait_for_prepared(shared);
     int ckptRc = run_external_checkpoint(mode, ckptBin, pids);
     if (ckptRc != 0) {
-      std::fprintf(stderr, "[parent] external cuda-checkpoint phase failed\n");
-      externalFailures++;
-      parent_release_restore(shared);
-    } else {
-      std::fprintf(stderr, "[parent] external cuda-checkpoint phase OK\n");
-      parent_release_restore(shared);
+      // Children sit in a frozen/half-restored CUDA state; letting them
+      // proceed to the post-restore allreduce would hang forever. Abort.
+      std::fprintf(stderr, "[parent] external cuda-checkpoint phase failed — killing children\n");
+      for (int i = 0; i < 2; ++i) kill(pids[i], SIGKILL);
+      for (int i = 0; i < 2; ++i) waitpid(pids[i], nullptr, 0);
+      std::fprintf(stderr, "TEST FAILED: %s mode (external cuda-checkpoint phase)\n", mode_name(mode));
+      return 1;
     }
+    std::fprintf(stderr, "[parent] external cuda-checkpoint phase OK\n");
+    parent_release_restore(shared);
   }
 
   int failures = externalFailures;

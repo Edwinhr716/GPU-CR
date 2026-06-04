@@ -1,0 +1,63 @@
+Register the "checkpoint" plugin type with NCCL's generic plugin loader, so
+src/plugin/checkpoint.cc can resolve the library named by
+$NCCL_CHECKPOINT_PLUGIN through the same machinery as net/tuner/profiler
+plugins.
+
+Apply from the NCCL source root:
+
+    git apply /path/to/GPU-CR/adapters/nccl/nccl_patches/plugin_loader.patch
+
+Generated against upstream v2.30.4-1; the hunks are small and apply with
+fuzz on nearby versions.
+
+--- a/src/include/plugin/plugin.h
++++ b/src/include/plugin/plugin.h
+@@ -16,6 +16,7 @@
+   ncclPluginTypeTuner,
+   ncclPluginTypeProfiler,
+   ncclPluginTypeEnv,
++  ncclPluginTypeCheckpoint,
+ };
+
+ void* ncclOpenNetPluginLib(const char* name);
+@@ -23,6 +24,7 @@
+ void* ncclOpenTunerPluginLib(const char* name);
+ void* ncclOpenProfilerPluginLib(const char* name);
+ void* ncclOpenEnvPluginLib(const char* name);
++void* ncclOpenCheckpointPluginLib(const char* name);
+ void* ncclGetNetPluginLib(enum ncclPluginType type);
+ ncclResult_t ncclClosePluginLib(void* handle, enum ncclPluginType type);
+
+--- a/src/plugin/plugin_open.cc
++++ b/src/plugin/plugin_open.cc
+@@ -15,14 +15,14 @@
+
+ #define MAX_STR_LEN 255
+
+-#define NUM_LIBS 5
++#define NUM_LIBS 6
+ static char* libNames[NUM_LIBS];
+ char* ncclPluginLibPaths[NUM_LIBS];
+ static void *libHandles[NUM_LIBS];
+-static const char *pluginNames[NUM_LIBS] = { "NET", "GIN", "TUNER", "PROFILER", "ENV" };
+-static const char *pluginPrefix[NUM_LIBS] = { "libnccl-net", "libnccl-gin", "libnccl-tuner", "libnccl-profiler", "libnccl-env" };
+-static const char *pluginFallback[NUM_LIBS] = { "", "", "", "", "" };
+-static unsigned long subsys[NUM_LIBS] = { NCCL_INIT|NCCL_NET, NCCL_INIT|NCCL_NET, NCCL_INIT|NCCL_TUNING, NCCL_INIT, NCCL_INIT|NCCL_ENV };
++static const char *pluginNames[NUM_LIBS] = { "NET", "GIN", "TUNER", "PROFILER", "ENV", "CHECKPOINT" };
++static const char *pluginPrefix[NUM_LIBS] = { "libnccl-net", "libnccl-gin", "libnccl-tuner", "libnccl-profiler", "libnccl-env", "libnccl-checkpoint" };
++static const char *pluginFallback[NUM_LIBS] = { "", "", "", "", "", "" };
++static unsigned long subsys[NUM_LIBS] = { NCCL_INIT|NCCL_NET, NCCL_INIT|NCCL_NET, NCCL_INIT|NCCL_TUNING, NCCL_INIT, NCCL_INIT|NCCL_ENV, NCCL_INIT };
+
+ static void* tryOpenLib(char* name, int* err, char* errStr) {
+   *err = 0;
+@@ -147,6 +147,10 @@
+   return openPluginLib(ncclPluginTypeEnv, name);
+ }
+
++void* ncclOpenCheckpointPluginLib(const char* name) {
++  return openPluginLib(ncclPluginTypeCheckpoint, name);
++}
++
+ void* ncclGetNetPluginLib(enum ncclPluginType type) {
+   if (libNames[ncclPluginTypeNet]) {
+     // increment the reference counter of the net library

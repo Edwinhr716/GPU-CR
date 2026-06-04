@@ -708,7 +708,11 @@ extern "C" cudaError_t cudaGetDriverEntryPoint(
     enum cudaDriverEntryPointQueryResult* driverStatus);
 extern "C" cudaError_t cudaGetDriverEntryPointByVersion(
     const char* symbol, void** funcPtr, unsigned int cudaVersion,
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12060
+    unsigned long long flags, cudaDriverEntryPointQueryResult* driverStatus);
+#else
     unsigned long long flags, void* driverStatus);
+#endif
 
 typedef void* (*real_dlsym_fn)(void*, const char*);
 static thread_local bool g_inside_dlsym_hook = false;
@@ -782,9 +786,14 @@ typedef cudaError_t (*cudaGetDriverEntryPoint_3p_fn)(
 // 4-param cudaGetDriverEntryPoint (CUDA 12 C++ overload)
 typedef cudaError_t (*cudaGetDriverEntryPoint_4p_fn)(
     const char*, void**, unsigned long long, enum cudaDriverEntryPointQueryResult*);
-// cudaGetDriverEntryPointByVersion (CUDA 12+ only)
+// cudaGetDriverEntryPointByVersion (CUDA 12.6+ only)
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12060
+typedef cudaError_t (*cudaGetDriverEntryPointByVersion_fn)(
+    const char*, void**, unsigned int, unsigned long long, cudaDriverEntryPointQueryResult*);
+#else
 typedef cudaError_t (*cudaGetDriverEntryPointByVersion_fn)(
     const char*, void**, unsigned int, unsigned long long, void*);
+#endif
 // cuGetProcAddress — 4-param (CUDA 11) and 5-param (CUDA 12 / _v2)
 typedef CUresult (*cuGetProcAddress_4p_fn)(const char*, void**, int, cuuint64_t);
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
@@ -979,7 +988,11 @@ cudaError_t cudaGetDriverEntryPoint(
 
 cudaError_t cudaGetDriverEntryPointByVersion(
     const char* symbol, void** funcPtr, unsigned int cudaVersion,
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12060
+    unsigned long long flags, cudaDriverEntryPointQueryResult* driverStatus)
+#else
     unsigned long long flags, void* driverStatus)
+#endif
 {
     static cudaGetDriverEntryPointByVersion_fn real_fn = nullptr;
     if (!real_fn) {
