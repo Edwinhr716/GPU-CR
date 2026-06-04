@@ -1,0 +1,51 @@
+/*
+ * GPU-CR checkpoint API additions for NCCL's public header.
+ *
+ * PASTE this whole block into ${NCCL_SRC}/src/nccl.h.in, anywhere in the
+ * function-declaration area (suggested: right after the ncclCommDeregister
+ * block), then rebuild NCCL so the generated nccl.h picks it up.
+ *
+ * These macros/declarations are NOT part of upstream NCCL — they belong to
+ * the GPU-CR patch set and must be applied together with checkpoint_api.cc.
+ * The values below are the canonical ones; the prebuilt GPU-CR plugin and
+ * examples are compiled against them, so do not change them.
+ */
+
+/* Communicator checkpoint modes */
+#define NCCL_CKPT_MODE_NATIVE       0x0001  // Use NCCL native suspend/resume (needs ncclCommSuspend, upstream >= 2.30)
+#define NCCL_CKPT_MODE_GCR_GLOBAL   0x0004  // Dispatch to a GCR checkpoint plugin
+#define NCCL_CKPT_MODE_MASK         (NCCL_CKPT_MODE_NATIVE | NCCL_CKPT_MODE_GCR_GLOBAL)
+
+/* Communicator checkpoint options */
+#define NCCL_CKPT_OPT_SAVE_DATA     0x0100  // Save GPU data before teardown
+#define NCCL_CKPT_OPT_NO_CUDA_CKPT  0x0200  // Do not invoke process-level checkpoint
+#define NCCL_CKPT_OPT_VALIDATE      0x0400  // Validate mappings after restore
+
+/* Communicator checkpoint restore phases */
+#define NCCL_CKPT_RESTORE_EXPORT    0x1000  // Rebuild local exports and publish new handles
+#define NCCL_CKPT_RESTORE_IMPORT    0x2000  // Re-import peer handles after fd exchange
+
+/*
+ * ncclCommCheckpointPrepare
+ *
+ * Prepare communicator resources for checkpoint.
+ *
+ * NCCL_CKPT_MODE_GCR_GLOBAL dispatches to the external checkpoint plugin
+ * (loaded from $NCCL_CHECKPOINT_PLUGIN).
+ * NCCL_CKPT_MODE_NATIVE forwards to ncclCommSuspend (upstream NCCL >= 2.30);
+ * on older NCCL without suspend support it returns ncclInvalidUsage.
+ */
+ncclResult_t  ncclCommCheckpointPrepare(ncclComm_t comm, int flags);
+ncclResult_t pncclCommCheckpointPrepare(ncclComm_t comm, int flags);
+
+/*
+ * ncclCommCheckpointRestore
+ *
+ * Restore communicator resources after checkpoint.
+ *
+ * In GCR_GLOBAL mode call twice: first with NCCL_CKPT_RESTORE_EXPORT, then
+ * with NCCL_CKPT_RESTORE_IMPORT (optionally | NCCL_CKPT_OPT_VALIDATE),
+ * exchanging the published handles between ranks in between.
+ */
+ncclResult_t  ncclCommCheckpointRestore(ncclComm_t comm, int flags);
+ncclResult_t pncclCommCheckpointRestore(ncclComm_t comm, int flags);

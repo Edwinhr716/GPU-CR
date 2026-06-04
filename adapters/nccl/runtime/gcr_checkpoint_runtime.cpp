@@ -329,6 +329,15 @@ extern "C" int gcr_checkpoint_prepare(int flags) {
   std::fprintf(stderr,
                "[GCR-RUNTIME] prepare done: imports=%d exports=%d events=%d locals=%d peers=%d total=%ld ms\n",
                imports, exports, events, locals, peers, totalMs);
+  if (imports == 0 && exports == 0 && locals == 0) {
+    std::fprintf(stderr,
+                 "[GCR-RUNTIME] WARNING: nothing was tracked — NCCL likely shared its "
+                 "buffers via legacy CUDA IPC instead of cuMem*. A subsequent "
+                 "cuda-checkpoint restore will probably fail with \"operation not "
+                 "supported\". Export NCCL_CUMEM_ENABLE=1 before starting the "
+                 "application (vLLM-style deployments additionally use "
+                 "NCCL_CUMEM_HOST_ENABLE=1 NCCL_P2P_DISABLE=1).\n");
+  }
   return 0;
 }
 
