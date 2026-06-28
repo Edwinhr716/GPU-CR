@@ -42,6 +42,7 @@ std::string get_cuda_checkpoint_path() {
 
 
 int main(int argc, char* argv[]) {
+    printf("custom image of GPU-CR\n");
     int opt;
     int init = 0;
     int ckpt = 0;
