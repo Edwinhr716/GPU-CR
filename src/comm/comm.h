@@ -34,6 +34,10 @@ public:
 #define NCCL_SUSPEND_MSG 13
 #define NCCL_RESUME_MSG  14
 
+// Selective checkpoint/restore: operate on a caller-supplied subset of memory regions
+#define SELECTIVE_CKPT_MSG    20
+#define SELECTIVE_RESTORE_MSG 21
+
 class ShareMemComm : public Comm {
 public:
     signal_controls* control;
