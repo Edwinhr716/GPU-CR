@@ -151,6 +151,7 @@ int nv::registerHostMemory(void* ptr, size_t size) {
     if (err != cudaSuccess) {
         fprintf(stderr, "[NVIDIA] cudaHostRegister failed: %s\n", cudaGetErrorString(err));
         fprintf(stderr, "[NVIDIA] This is expected for hugepage-backed memory, continuing without pinned memory\n");
+        cudaGetLastError(); // Clear the error so it doesn't pollute the runtime state
         return -1;  // Return error but don't exit - non-pinned memory will still work
     }
     return 0;
