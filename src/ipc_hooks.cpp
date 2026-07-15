@@ -914,6 +914,8 @@ cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void
     if (real_cudaLaunchKernel) {
         result = real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
     }
+    fprintf(stderr, "[HOOK] cudaLaunchKernel returned %d\n", result);
+    fflush(stderr);
 
     if (pushed) {
         CUcontext popped;
@@ -944,6 +946,8 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned in
     if (real_cuLaunchKernel) {
         result = real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
     }
+    fprintf(stderr, "[HOOK] cuLaunchKernel returned %d\n", result);
+    fflush(stderr);
 
     if (pushed) {
         CUcontext popped;
@@ -974,6 +978,8 @@ cudaError_t cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim,
     if (real_cudaLaunchKernel_ptsz) {
         result = real_cudaLaunchKernel_ptsz(func, gridDim, blockDim, args, sharedMem, stream);
     }
+    fprintf(stderr, "[HOOK] cudaLaunchKernel_ptsz returned %d\n", result);
+    fflush(stderr);
 
     if (pushed) {
         CUcontext popped;
@@ -1004,6 +1010,8 @@ CUresult CUDAAPI cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsign
     if (real_cuLaunchKernel_ptsz) {
         result = real_cuLaunchKernel_ptsz(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
     }
+    fprintf(stderr, "[HOOK] cuLaunchKernel_ptsz (driver) returned %d\n", result);
+    fflush(stderr);
 
     if (pushed) {
         CUcontext popped;
@@ -1039,6 +1047,8 @@ extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfun
     if (real_cuLaunchKernelEx) {
         result = real_cuLaunchKernelEx(config, f, kernelParams, extra);
     }
+    fprintf(stderr, "[HOOK] cuLaunchKernelEx returned %d\n", result);
+    fflush(stderr);
     
     if (pushed) {
         CUcontext popped;
@@ -1070,6 +1080,8 @@ extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, con
     if (real_cudaLaunchKernelExC) {
         result = real_cudaLaunchKernelExC(config, func, args);
     }
+    fprintf(stderr, "[HOOK] cudaLaunchKernelExC returned %d\n", result);
+    fflush(stderr);
 
     if (pushed) {
         CUcontext popped;
@@ -1100,6 +1112,8 @@ extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config
     if (real_cudaLaunchKernelExC_ptsz) {
         result = real_cudaLaunchKernelExC_ptsz(config, func, args);
     }
+    fprintf(stderr, "[HOOK] cudaLaunchKernelExC_ptsz returned %d\n", result);
+    fflush(stderr);
 
     if (pushed) {
         CUcontext popped;
@@ -1130,6 +1144,8 @@ extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 b
     if (real___cudaLaunchKernel) {
         result = real___cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
     }
+    fprintf(stderr, "[HOOK] __cudaLaunchKernel returned %d\n", result);
+    fflush(stderr);
 
     if (pushed) {
         CUcontext popped;
@@ -1160,6 +1176,8 @@ extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, d
     if (real___cudaLaunchKernel_ptsz) {
         result = real___cudaLaunchKernel_ptsz(func, gridDim, blockDim, args, sharedMem, stream);
     }
+    fprintf(stderr, "[HOOK] __cudaLaunchKernel_ptsz returned %d\n", result);
+    fflush(stderr);
 
     if (pushed) {
         CUcontext popped;
