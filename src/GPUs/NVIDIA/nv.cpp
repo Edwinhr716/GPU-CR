@@ -15,7 +15,7 @@ std::map<void*, int> allocated_memory_type;  // 0=cudaMalloc, 1=VMM
 
 // Global handle map for all VMM allocations (both from hook and nv::allocate)
 static std::map<void*, CUmemGenericAllocationHandle> global_handle_map;
-static CUcontext g_pytorch_context = nullptr;
+CUcontext g_pytorch_context = nullptr;
 
 // P2P peer access hooks and helpers live in src/ipc_hooks.cpp (canonical).
 
