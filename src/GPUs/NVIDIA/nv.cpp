@@ -485,31 +485,3 @@ extern "C" cudaError_t cudaFree(void* ptr) {
 // P2P peer access hooks (cudaDeviceEnablePeerAccess / cudaDeviceDisablePeerAccess)
 // and the disable/reenable helpers used by vGPU.cpp are defined in
 // src/ipc_hooks.cpp (canonical), to keep IPC + P2P state in one place.
-
-typedef cudaError_t (*cudaLaunchKernel_func_t)(const void*, dim3, dim3, void**, size_t, cudaStream_t);
-static cudaLaunchKernel_func_t real_cudaLaunchKernel = nullptr;
-
-extern "C" cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream) {
-    CUcontext ctx = nullptr;
-    cuCtxGetCurrent(&ctx);
-    fprintf(stderr, "[HOOK] cudaLaunchKernel: current ctx=%p\n", ctx);
-    fflush(stderr);
-    if (!real_cudaLaunchKernel) {
-        real_cudaLaunchKernel = (cudaLaunchKernel_func_t)dlsym(RTLD_NEXT, "cudaLaunchKernel");
-    }
-    return real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
-}
-
-typedef CUresult (*cuLaunchKernel_func_t)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, CUstream, void**, void**);
-static cuLaunchKernel_func_t real_cuLaunchKernel = nullptr;
-
-extern "C" CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
-    CUcontext ctx = nullptr;
-    cuCtxGetCurrent(&ctx);
-    fprintf(stderr, "[HOOK] cuLaunchKernel: current ctx=%p\n", ctx);
-    fflush(stderr);
-    if (!real_cuLaunchKernel) {
-        real_cuLaunchKernel = (cuLaunchKernel_func_t)dlsym(RTLD_NEXT, "cuLaunchKernel");
-    }
-    return real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
-}
