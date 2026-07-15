@@ -672,18 +672,27 @@ struct HookEntry {
 typedef cudaError_t (*cudaLaunchKernel_fn)(const void*, dim3, dim3, void**, size_t, cudaStream_t);
 typedef CUresult (*cuLaunchKernel_fn)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, CUstream, void**, void**);
 typedef CUresult (*cuLaunchKernelEx_fn)(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
+typedef cudaError_t (*cudaLaunchKernelExC_fn)(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra);
 
 static cudaLaunchKernel_fn real_cudaLaunchKernel = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel = nullptr;
 static cudaLaunchKernel_fn real_cudaLaunchKernel_ptsz = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel_ptsz = nullptr;
 static cuLaunchKernelEx_fn real_cuLaunchKernelEx = nullptr;
+static cudaLaunchKernelExC_fn real_cudaLaunchKernelExC = nullptr;
+static cudaLaunchKernelExC_fn real_cudaLaunchKernelExC_ptsz = nullptr;
+static cudaLaunchKernel_fn real___cudaLaunchKernel = nullptr;
+static cudaLaunchKernel_fn real___cudaLaunchKernel_ptsz = nullptr;
 
 extern "C" cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
 extern "C" cudaError_t cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
 extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
+extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra);
+extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra);
+extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
+extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 
 static HookEntry g_hook_table[] = {
     {"cuMemCreate",                    (void*)hook_cuMemCreate,                    (void**)&real_cuMemCreate},
@@ -698,6 +707,10 @@ static HookEntry g_hook_table[] = {
     {"cudaLaunchKernel_ptsz",          (void*)(cudaLaunchKernel_fn)cudaLaunchKernel_ptsz, (void**)&real_cudaLaunchKernel_ptsz},
     {"cuLaunchKernel_ptsz",            (void*)(cuLaunchKernel_fn)cuLaunchKernel_ptsz,     (void**)&real_cuLaunchKernel_ptsz},
     {"cuLaunchKernelEx",               (void*)(cuLaunchKernelEx_fn)cuLaunchKernelEx, (void**)&real_cuLaunchKernelEx},
+    {"cudaLaunchKernelExC",            (void*)(cudaLaunchKernelExC_fn)cudaLaunchKernelExC, (void**)&real_cudaLaunchKernelExC},
+    {"cudaLaunchKernelExC_ptsz",       (void*)(cudaLaunchKernelExC_fn)cudaLaunchKernelExC_ptsz, (void**)&real_cudaLaunchKernelExC_ptsz},
+    {"__cudaLaunchKernel",             (void*)(cudaLaunchKernel_fn)__cudaLaunchKernel, (void**)&real___cudaLaunchKernel},
+    {"__cudaLaunchKernel_ptsz",        (void*)(cudaLaunchKernel_fn)__cudaLaunchKernel_ptsz, (void**)&real___cudaLaunchKernel_ptsz},
     {nullptr, nullptr, nullptr}
 };
 
@@ -1032,6 +1045,126 @@ extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfun
         cuCtxPopCurrent(&popped);
     }
     
+    return result;
+}
+
+extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra) {
+    CUcontext ctx = nullptr;
+    cuCtxGetCurrent(&ctx);
+    fprintf(stderr, "[HOOK] cudaLaunchKernelExC: current ctx=%p\n", ctx);
+    fflush(stderr);
+
+    bool pushed = false;
+    if (g_pytorch_context != nullptr && ctx != g_pytorch_context) {
+        fprintf(stderr, "[HOOK] cudaLaunchKernelExC: context mismatch (current=%p, captured=%p), pushing captured\n", ctx, g_pytorch_context);
+        if (cuCtxPushCurrent(g_pytorch_context) == CUDA_SUCCESS) {
+            pushed = true;
+        }
+    }
+
+    if (!real_cudaLaunchKernelExC) {
+        real_cudaLaunchKernelExC = (cudaLaunchKernelExC_fn)dlsym(RTLD_NEXT, "cudaLaunchKernelExC");
+    }
+
+    cudaError_t result = cudaErrorUnknown;
+    if (real_cudaLaunchKernelExC) {
+        result = real_cudaLaunchKernelExC(config, func, args, extra);
+    }
+
+    if (pushed) {
+        CUcontext popped;
+        cuCtxPopCurrent(&popped);
+    }
+    return result;
+}
+
+extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra) {
+    CUcontext ctx = nullptr;
+    cuCtxGetCurrent(&ctx);
+    fprintf(stderr, "[HOOK] cudaLaunchKernelExC_ptsz: current ctx=%p\n", ctx);
+    fflush(stderr);
+
+    bool pushed = false;
+    if (g_pytorch_context != nullptr && ctx != g_pytorch_context) {
+        fprintf(stderr, "[HOOK] cudaLaunchKernelExC_ptsz: context mismatch (current=%p, captured=%p), pushing captured\n", ctx, g_pytorch_context);
+        if (cuCtxPushCurrent(g_pytorch_context) == CUDA_SUCCESS) {
+            pushed = true;
+        }
+    }
+
+    if (!real_cudaLaunchKernelExC_ptsz) {
+        real_cudaLaunchKernelExC_ptsz = (cudaLaunchKernelExC_fn)dlsym(RTLD_NEXT, "cudaLaunchKernelExC_ptsz");
+    }
+
+    cudaError_t result = cudaErrorUnknown;
+    if (real_cudaLaunchKernelExC_ptsz) {
+        result = real_cudaLaunchKernelExC_ptsz(config, func, args, extra);
+    }
+
+    if (pushed) {
+        CUcontext popped;
+        cuCtxPopCurrent(&popped);
+    }
+    return result;
+}
+
+extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream) {
+    CUcontext ctx = nullptr;
+    cuCtxGetCurrent(&ctx);
+    fprintf(stderr, "[HOOK] __cudaLaunchKernel: current ctx=%p\n", ctx);
+    fflush(stderr);
+
+    bool pushed = false;
+    if (g_pytorch_context != nullptr && ctx != g_pytorch_context) {
+        fprintf(stderr, "[HOOK] __cudaLaunchKernel: context mismatch (current=%p, captured=%p), pushing captured\n", ctx, g_pytorch_context);
+        if (cuCtxPushCurrent(g_pytorch_context) == CUDA_SUCCESS) {
+            pushed = true;
+        }
+    }
+
+    if (!real___cudaLaunchKernel) {
+        real___cudaLaunchKernel = (cudaLaunchKernel_fn)dlsym(RTLD_NEXT, "__cudaLaunchKernel");
+    }
+
+    cudaError_t result = cudaErrorUnknown;
+    if (real___cudaLaunchKernel) {
+        result = real___cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
+    }
+
+    if (pushed) {
+        CUcontext popped;
+        cuCtxPopCurrent(&popped);
+    }
+    return result;
+}
+
+extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream) {
+    CUcontext ctx = nullptr;
+    cuCtxGetCurrent(&ctx);
+    fprintf(stderr, "[HOOK] __cudaLaunchKernel_ptsz: current ctx=%p\n", ctx);
+    fflush(stderr);
+
+    bool pushed = false;
+    if (g_pytorch_context != nullptr && ctx != g_pytorch_context) {
+        fprintf(stderr, "[HOOK] __cudaLaunchKernel_ptsz: context mismatch (current=%p, captured=%p), pushing captured\n", ctx, g_pytorch_context);
+        if (cuCtxPushCurrent(g_pytorch_context) == CUDA_SUCCESS) {
+            pushed = true;
+        }
+    }
+
+    if (!real___cudaLaunchKernel_ptsz) {
+        real___cudaLaunchKernel_ptsz = (cudaLaunchKernel_fn)dlsym(RTLD_NEXT, "__cudaLaunchKernel_ptsz");
+    }
+
+    cudaError_t result = cudaErrorUnknown;
+    if (real___cudaLaunchKernel_ptsz) {
+        result = real___cudaLaunchKernel_ptsz(func, gridDim, blockDim, args, sharedMem, stream);
+    }
+
+    if (pushed) {
+        CUcontext popped;
+        cuCtxPopCurrent(&popped);
+    }
     return result;
 }
 
