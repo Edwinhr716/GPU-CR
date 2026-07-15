@@ -676,6 +676,10 @@ typedef cudaError_t (*cudaLaunchKernelExC_fn)(const cudaLaunchConfig_t* config, 
 typedef cudaError_t (*cudaGetLastError_fn)();
 typedef cudaError_t (*cudaPeekAtLastError_fn)();
 typedef cudaError_t (*cudaStreamSynchronize_fn)(cudaStream_t);
+typedef CUresult (*cuCtxCreate_fn)(CUcontext*, unsigned int, CUdevice);
+typedef CUresult (*cuCtxDestroy_fn)(CUcontext);
+typedef CUresult (*cuDevicePrimaryCtxRetain_fn)(CUcontext*, CUdevice);
+typedef CUresult (*cuDevicePrimaryCtxRelease_fn)(CUdevice);
 
 static cudaLaunchKernel_fn real_cudaLaunchKernel = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel = nullptr;
@@ -690,6 +694,10 @@ static cudaGetLastError_fn real_cudaGetLastError = nullptr;
 static cudaPeekAtLastError_fn real_cudaPeekAtLastError = nullptr;
 static cudaStreamSynchronize_fn real_cudaStreamSynchronize = nullptr;
 static cudaStreamSynchronize_fn real_cudaStreamSynchronize_ptsz = nullptr;
+static cuCtxCreate_fn real_cuCtxCreate = nullptr;
+static cuCtxDestroy_fn real_cuCtxDestroy = nullptr;
+static cuDevicePrimaryCtxRetain_fn real_cuDevicePrimaryCtxRetain = nullptr;
+static cuDevicePrimaryCtxRelease_fn real_cuDevicePrimaryCtxRelease = nullptr;
 
 extern "C" cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
@@ -704,6 +712,10 @@ extern "C" cudaError_t cudaGetLastError();
 extern "C" cudaError_t cudaPeekAtLastError();
 extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream);
 extern "C" cudaError_t cudaStreamSynchronize_ptsz(cudaStream_t stream);
+extern "C" CUresult CUDAAPI hook_cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev);
+extern "C" CUresult CUDAAPI hook_cuCtxDestroy(CUcontext ctx);
+extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev);
+extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRelease(CUdevice dev);
 
 static HookEntry g_hook_table[] = {
     {"cuMemCreate",                    (void*)hook_cuMemCreate,                    (void**)&real_cuMemCreate},
@@ -726,6 +738,10 @@ static HookEntry g_hook_table[] = {
     {"cudaPeekAtLastError",            (void*)cudaPeekAtLastError,                 (void**)&real_cudaPeekAtLastError},
     {"cudaStreamSynchronize",          (void*)cudaStreamSynchronize,               (void**)&real_cudaStreamSynchronize},
     {"cudaStreamSynchronize_ptsz",     (void*)cudaStreamSynchronize_ptsz,          (void**)&real_cudaStreamSynchronize_ptsz},
+    {"cuCtxCreate",                    (void*)hook_cuCtxCreate,                    (void**)&real_cuCtxCreate},
+    {"cuCtxDestroy",                   (void*)hook_cuCtxDestroy,                   (void**)&real_cuCtxDestroy},
+    {"cuDevicePrimaryCtxRetain",       (void*)hook_cuDevicePrimaryCtxRetain,       (void**)&real_cuDevicePrimaryCtxRetain},
+    {"cuDevicePrimaryCtxRelease",      (void*)hook_cuDevicePrimaryCtxRelease,      (void**)&real_cuDevicePrimaryCtxRelease},
     {nullptr, nullptr, nullptr}
 };
 
@@ -2825,4 +2841,52 @@ int ipc_validate_all_mappings(const char* label) {
     fprintf(stderr, "[IPC-VALIDATE] Checked %d mappings, %d errors\n", checked, errors);
     fprintf(stderr, "[IPC-VALIDATE] ===========================\n\n");
     return errors;
+}
+
+extern "C" CUresult CUDAAPI hook_cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
+    if (!real_cuCtxCreate) {
+        real_cuCtxCreate = (cuCtxCreate_fn)dlsym(RTLD_NEXT, "cuCtxCreate");
+    }
+    CUresult res = real_cuCtxCreate(pctx, flags, dev);
+    if (res == CUDA_SUCCESS) {
+        fprintf(stderr, "[HOOK] cuCtxCreate created ctx=%p for dev=%d\n", *pctx, dev);
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[HOOK] cuCtxCreate failed: %d\n", res);
+        fflush(stderr);
+    }
+    return res;
+}
+
+extern "C" CUresult CUDAAPI hook_cuCtxDestroy(CUcontext ctx) {
+    fprintf(stderr, "[HOOK] cuCtxDestroy destroying ctx=%p\n", ctx);
+    fflush(stderr);
+    if (!real_cuCtxDestroy) {
+        real_cuCtxDestroy = (cuCtxDestroy_fn)dlsym(RTLD_NEXT, "cuCtxDestroy");
+    }
+    return real_cuCtxDestroy(ctx);
+}
+
+extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
+    if (!real_cuDevicePrimaryCtxRetain) {
+        real_cuDevicePrimaryCtxRetain = (cuDevicePrimaryCtxRetain_fn)dlsym(RTLD_NEXT, "cuDevicePrimaryCtxRetain");
+    }
+    CUresult res = real_cuDevicePrimaryCtxRetain(pctx, dev);
+    if (res == CUDA_SUCCESS) {
+        fprintf(stderr, "[HOOK] cuDevicePrimaryCtxRetain retained ctx=%p for dev=%d\n", *pctx, dev);
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[HOOK] cuDevicePrimaryCtxRetain failed: %d\n", res);
+        fflush(stderr);
+    }
+    return res;
+}
+
+extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRelease(CUdevice dev) {
+    fprintf(stderr, "[HOOK] cuDevicePrimaryCtxRelease for dev=%d\n", dev);
+    fflush(stderr);
+    if (!real_cuDevicePrimaryCtxRelease) {
+        real_cuDevicePrimaryCtxRelease = (cuDevicePrimaryCtxRelease_fn)dlsym(RTLD_NEXT, "cuDevicePrimaryCtxRelease");
+    }
+    return real_cuDevicePrimaryCtxRelease(dev);
 }
