@@ -1268,6 +1268,13 @@ extern "C" cudaError_t cudaPeekAtLastError() {
 extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
     fprintf(stderr, "[HOOK] cudaStreamSynchronize(stream=%p)\n", stream);
     fflush(stderr);
+
+    cudaError_t pre_err = cudaPeekAtLastError();
+    if (pre_err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaStreamSynchronize: pre-existing error (peek): %d (%s)\n", pre_err, cudaGetErrorString(pre_err));
+        fflush(stderr);
+    }
+
     if (!real_cudaStreamSynchronize) {
         real_cudaStreamSynchronize = (cudaStreamSynchronize_fn)dlsym(RTLD_NEXT, "cudaStreamSynchronize");
     }
@@ -1276,12 +1283,26 @@ extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
         fprintf(stderr, "[HOOK] cudaStreamSynchronize returned %d (%s)\n", err, cudaGetErrorString(err));
         fflush(stderr);
     }
+
+    cudaError_t post_err = cudaPeekAtLastError();
+    if (post_err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaStreamSynchronize: post-op error (peek): %d (%s)\n", post_err, cudaGetErrorString(post_err));
+        fflush(stderr);
+    }
+
     return err;
 }
 
 extern "C" cudaError_t cudaStreamSynchronize_ptsz(cudaStream_t stream) {
     fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz(stream=%p)\n", stream);
     fflush(stderr);
+
+    cudaError_t pre_err = cudaPeekAtLastError();
+    if (pre_err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz: pre-existing error (peek): %d (%s)\n", pre_err, cudaGetErrorString(pre_err));
+        fflush(stderr);
+    }
+
     if (!real_cudaStreamSynchronize_ptsz) {
         real_cudaStreamSynchronize_ptsz = (cudaStreamSynchronize_fn)dlsym(RTLD_NEXT, "cudaStreamSynchronize_ptsz");
     }
@@ -1290,6 +1311,13 @@ extern "C" cudaError_t cudaStreamSynchronize_ptsz(cudaStream_t stream) {
         fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz returned %d (%s)\n", err, cudaGetErrorString(err));
         fflush(stderr);
     }
+
+    cudaError_t post_err = cudaPeekAtLastError();
+    if (post_err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz: post-op error (peek): %d (%s)\n", post_err, cudaGetErrorString(post_err));
+        fflush(stderr);
+    }
+
     return err;
 }
 
