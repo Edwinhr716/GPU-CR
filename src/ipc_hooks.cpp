@@ -672,7 +672,7 @@ struct HookEntry {
 typedef cudaError_t (*cudaLaunchKernel_fn)(const void*, dim3, dim3, void**, size_t, cudaStream_t);
 typedef CUresult (*cuLaunchKernel_fn)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, CUstream, void**, void**);
 typedef CUresult (*cuLaunchKernelEx_fn)(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
-typedef cudaError_t (*cudaLaunchKernelExC_fn)(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra);
+typedef cudaError_t (*cudaLaunchKernelExC_fn)(const cudaLaunchConfig_t* config, const void* func, void** args);
 
 static cudaLaunchKernel_fn real_cudaLaunchKernel = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel = nullptr;
@@ -689,8 +689,8 @@ extern "C" CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, 
 extern "C" cudaError_t cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
 extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
-extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra);
-extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra);
+extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args);
+extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args);
 extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 
@@ -1048,7 +1048,7 @@ extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfun
     return result;
 }
 
-extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra) {
+extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args) {
     CUcontext ctx = nullptr;
     cuCtxGetCurrent(&ctx);
     fprintf(stderr, "[HOOK] cudaLaunchKernelExC: current ctx=%p\n", ctx);
@@ -1068,7 +1068,7 @@ extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, con
 
     cudaError_t result = cudaErrorUnknown;
     if (real_cudaLaunchKernelExC) {
-        result = real_cudaLaunchKernelExC(config, func, args, extra);
+        result = real_cudaLaunchKernelExC(config, func, args);
     }
 
     if (pushed) {
@@ -1078,7 +1078,7 @@ extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, con
     return result;
 }
 
-extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args, void** extra) {
+extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args) {
     CUcontext ctx = nullptr;
     cuCtxGetCurrent(&ctx);
     fprintf(stderr, "[HOOK] cudaLaunchKernelExC_ptsz: current ctx=%p\n", ctx);
@@ -1098,7 +1098,7 @@ extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config
 
     cudaError_t result = cudaErrorUnknown;
     if (real_cudaLaunchKernelExC_ptsz) {
-        result = real_cudaLaunchKernelExC_ptsz(config, func, args, extra);
+        result = real_cudaLaunchKernelExC_ptsz(config, func, args);
     }
 
     if (pushed) {
