@@ -673,6 +673,9 @@ typedef cudaError_t (*cudaLaunchKernel_fn)(const void*, dim3, dim3, void**, size
 typedef CUresult (*cuLaunchKernel_fn)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, CUstream, void**, void**);
 typedef CUresult (*cuLaunchKernelEx_fn)(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
 typedef cudaError_t (*cudaLaunchKernelExC_fn)(const cudaLaunchConfig_t* config, const void* func, void** args);
+typedef cudaError_t (*cudaGetLastError_fn)();
+typedef cudaError_t (*cudaPeekAtLastError_fn)();
+typedef cudaError_t (*cudaStreamSynchronize_fn)(cudaStream_t);
 
 static cudaLaunchKernel_fn real_cudaLaunchKernel = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel = nullptr;
@@ -683,6 +686,10 @@ static cudaLaunchKernelExC_fn real_cudaLaunchKernelExC = nullptr;
 static cudaLaunchKernelExC_fn real_cudaLaunchKernelExC_ptsz = nullptr;
 static cudaLaunchKernel_fn real___cudaLaunchKernel = nullptr;
 static cudaLaunchKernel_fn real___cudaLaunchKernel_ptsz = nullptr;
+static cudaGetLastError_fn real_cudaGetLastError = nullptr;
+static cudaPeekAtLastError_fn real_cudaPeekAtLastError = nullptr;
+static cudaStreamSynchronize_fn real_cudaStreamSynchronize = nullptr;
+static cudaStreamSynchronize_fn real_cudaStreamSynchronize_ptsz = nullptr;
 
 extern "C" cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
@@ -693,6 +700,10 @@ extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, con
 extern "C" cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args);
 extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
+extern "C" cudaError_t cudaGetLastError();
+extern "C" cudaError_t cudaPeekAtLastError();
+extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream);
+extern "C" cudaError_t cudaStreamSynchronize_ptsz(cudaStream_t stream);
 
 static HookEntry g_hook_table[] = {
     {"cuMemCreate",                    (void*)hook_cuMemCreate,                    (void**)&real_cuMemCreate},
@@ -711,6 +722,10 @@ static HookEntry g_hook_table[] = {
     {"cudaLaunchKernelExC_ptsz",       (void*)(cudaLaunchKernelExC_fn)cudaLaunchKernelExC_ptsz, (void**)&real_cudaLaunchKernelExC_ptsz},
     {"__cudaLaunchKernel",             (void*)(cudaLaunchKernel_fn)__cudaLaunchKernel, (void**)&real___cudaLaunchKernel},
     {"__cudaLaunchKernel_ptsz",        (void*)(cudaLaunchKernel_fn)__cudaLaunchKernel_ptsz, (void**)&real___cudaLaunchKernel_ptsz},
+    {"cudaGetLastError",               (void*)cudaGetLastError,                    (void**)&real_cudaGetLastError},
+    {"cudaPeekAtLastError",            (void*)cudaPeekAtLastError,                 (void**)&real_cudaPeekAtLastError},
+    {"cudaStreamSynchronize",          (void*)cudaStreamSynchronize,               (void**)&real_cudaStreamSynchronize},
+    {"cudaStreamSynchronize_ptsz",     (void*)cudaStreamSynchronize_ptsz,          (void**)&real_cudaStreamSynchronize_ptsz},
     {nullptr, nullptr, nullptr}
 };
 
@@ -1184,6 +1199,58 @@ extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, d
         cuCtxPopCurrent(&popped);
     }
     return result;
+}
+
+extern "C" cudaError_t cudaGetLastError() {
+    if (!real_cudaGetLastError) {
+        real_cudaGetLastError = (cudaGetLastError_fn)dlsym(RTLD_NEXT, "cudaGetLastError");
+    }
+    cudaError_t err = real_cudaGetLastError ? real_cudaGetLastError() : cudaErrorUnknown;
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaGetLastError returned %d (%s)\n", err, cudaGetErrorString(err));
+        fflush(stderr);
+    }
+    return err;
+}
+
+extern "C" cudaError_t cudaPeekAtLastError() {
+    if (!real_cudaPeekAtLastError) {
+        real_cudaPeekAtLastError = (cudaPeekAtLastError_fn)dlsym(RTLD_NEXT, "cudaPeekAtLastError");
+    }
+    cudaError_t err = real_cudaPeekAtLastError ? real_cudaPeekAtLastError() : cudaErrorUnknown;
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaPeekAtLastError returned %d (%s)\n", err, cudaGetErrorString(err));
+        fflush(stderr);
+    }
+    return err;
+}
+
+extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
+    fprintf(stderr, "[HOOK] cudaStreamSynchronize(stream=%p)\n", stream);
+    fflush(stderr);
+    if (!real_cudaStreamSynchronize) {
+        real_cudaStreamSynchronize = (cudaStreamSynchronize_fn)dlsym(RTLD_NEXT, "cudaStreamSynchronize");
+    }
+    cudaError_t err = real_cudaStreamSynchronize ? real_cudaStreamSynchronize(stream) : cudaErrorUnknown;
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaStreamSynchronize returned %d (%s)\n", err, cudaGetErrorString(err));
+        fflush(stderr);
+    }
+    return err;
+}
+
+extern "C" cudaError_t cudaStreamSynchronize_ptsz(cudaStream_t stream) {
+    fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz(stream=%p)\n", stream);
+    fflush(stderr);
+    if (!real_cudaStreamSynchronize_ptsz) {
+        real_cudaStreamSynchronize_ptsz = (cudaStreamSynchronize_fn)dlsym(RTLD_NEXT, "cudaStreamSynchronize_ptsz");
+    }
+    cudaError_t err = real_cudaStreamSynchronize_ptsz ? real_cudaStreamSynchronize_ptsz(stream) : cudaErrorUnknown;
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz returned %d (%s)\n", err, cudaGetErrorString(err));
+        fflush(stderr);
+    }
+    return err;
 }
 
 CUresult CUDAAPI cuMemExportToShareableHandle(void* shareableHandle,
