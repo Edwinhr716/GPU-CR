@@ -684,8 +684,8 @@ static HookEntry g_hook_table[] = {
     {"cuMemUnmap",                     (void*)hook_cuMemUnmap,                     (void**)&real_cuMemUnmap},
     {"cuMemRelease",                   (void*)hook_cuMemRelease,                   (void**)&fn_cuMemRelease},
     {"cuMemSetAccess",                 (void*)hook_cuMemSetAccess,                 (void**)&real_cuMemSetAccess},
-    {"cudaLaunchKernel",               (void*)cudaLaunchKernel,                    (void**)&real_cudaLaunchKernel},
-    {"cuLaunchKernel",                 (void*)cuLaunchKernel,                      (void**)&real_cuLaunchKernel},
+    {"cudaLaunchKernel",               (void*)(cudaLaunchKernel_fn)cudaLaunchKernel, (void**)&real_cudaLaunchKernel},
+    {"cuLaunchKernel",                 (void*)(cuLaunchKernel_fn)cuLaunchKernel,     (void**)&real_cuLaunchKernel},
     {nullptr, nullptr, nullptr}
 };
 
