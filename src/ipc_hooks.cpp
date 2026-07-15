@@ -1159,12 +1159,6 @@ extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 b
     fprintf(stderr, "[HOOK] __cudaLaunchKernel: current ctx=%p\n", ctx);
     fflush(stderr);
 
-    cudaError_t pre_err = cudaPeekAtLastError();
-    if (pre_err != cudaSuccess) {
-        fprintf(stderr, "[HOOK] __cudaLaunchKernel: pre-existing error (peek): %d (%s)\n", pre_err, cudaGetErrorString(pre_err));
-        fflush(stderr);
-    }
-
     bool pushed = false;
     if (g_pytorch_context != nullptr && ctx != g_pytorch_context) {
         fprintf(stderr, "[HOOK] __cudaLaunchKernel: context mismatch (current=%p, captured=%p), pushing captured\n", ctx, g_pytorch_context);
@@ -1184,12 +1178,6 @@ extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 gridDim, dim3 b
     fprintf(stderr, "[HOOK] __cudaLaunchKernel returned %d\n", result);
     fflush(stderr);
 
-    cudaError_t post_err = cudaPeekAtLastError();
-    if (post_err != cudaSuccess) {
-        fprintf(stderr, "[HOOK] __cudaLaunchKernel: post-launch error (peek): %d (%s)\n", post_err, cudaGetErrorString(post_err));
-        fflush(stderr);
-    }
-
     if (pushed) {
         CUcontext popped;
         cuCtxPopCurrent(&popped);
@@ -1202,12 +1190,6 @@ extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, d
     cuCtxGetCurrent(&ctx);
     fprintf(stderr, "[HOOK] __cudaLaunchKernel_ptsz: current ctx=%p\n", ctx);
     fflush(stderr);
-
-    cudaError_t pre_err = cudaPeekAtLastError();
-    if (pre_err != cudaSuccess) {
-        fprintf(stderr, "[HOOK] __cudaLaunchKernel_ptsz: pre-existing error (peek): %d (%s)\n", pre_err, cudaGetErrorString(pre_err));
-        fflush(stderr);
-    }
 
     bool pushed = false;
     if (g_pytorch_context != nullptr && ctx != g_pytorch_context) {
@@ -1227,12 +1209,6 @@ extern "C" cudaError_t __cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, d
     }
     fprintf(stderr, "[HOOK] __cudaLaunchKernel_ptsz returned %d\n", result);
     fflush(stderr);
-
-    cudaError_t post_err = cudaPeekAtLastError();
-    if (post_err != cudaSuccess) {
-        fprintf(stderr, "[HOOK] __cudaLaunchKernel_ptsz: post-launch error (peek): %d (%s)\n", post_err, cudaGetErrorString(post_err));
-        fflush(stderr);
-    }
 
     if (pushed) {
         CUcontext popped;
@@ -1269,24 +1245,12 @@ extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
     fprintf(stderr, "[HOOK] cudaStreamSynchronize(stream=%p)\n", stream);
     fflush(stderr);
 
-    cudaError_t pre_err = cudaPeekAtLastError();
-    if (pre_err != cudaSuccess) {
-        fprintf(stderr, "[HOOK] cudaStreamSynchronize: pre-existing error (peek): %d (%s)\n", pre_err, cudaGetErrorString(pre_err));
-        fflush(stderr);
-    }
-
     if (!real_cudaStreamSynchronize) {
         real_cudaStreamSynchronize = (cudaStreamSynchronize_fn)dlsym(RTLD_NEXT, "cudaStreamSynchronize");
     }
     cudaError_t err = real_cudaStreamSynchronize ? real_cudaStreamSynchronize(stream) : cudaErrorUnknown;
     if (err != cudaSuccess) {
         fprintf(stderr, "[HOOK] cudaStreamSynchronize returned %d (%s)\n", err, cudaGetErrorString(err));
-        fflush(stderr);
-    }
-
-    cudaError_t post_err = cudaPeekAtLastError();
-    if (post_err != cudaSuccess) {
-        fprintf(stderr, "[HOOK] cudaStreamSynchronize: post-op error (peek): %d (%s)\n", post_err, cudaGetErrorString(post_err));
         fflush(stderr);
     }
 
@@ -1297,24 +1261,12 @@ extern "C" cudaError_t cudaStreamSynchronize_ptsz(cudaStream_t stream) {
     fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz(stream=%p)\n", stream);
     fflush(stderr);
 
-    cudaError_t pre_err = cudaPeekAtLastError();
-    if (pre_err != cudaSuccess) {
-        fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz: pre-existing error (peek): %d (%s)\n", pre_err, cudaGetErrorString(pre_err));
-        fflush(stderr);
-    }
-
     if (!real_cudaStreamSynchronize_ptsz) {
         real_cudaStreamSynchronize_ptsz = (cudaStreamSynchronize_fn)dlsym(RTLD_NEXT, "cudaStreamSynchronize_ptsz");
     }
     cudaError_t err = real_cudaStreamSynchronize_ptsz ? real_cudaStreamSynchronize_ptsz(stream) : cudaErrorUnknown;
     if (err != cudaSuccess) {
         fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz returned %d (%s)\n", err, cudaGetErrorString(err));
-        fflush(stderr);
-    }
-
-    cudaError_t post_err = cudaPeekAtLastError();
-    if (post_err != cudaSuccess) {
-        fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz: post-op error (peek): %d (%s)\n", post_err, cudaGetErrorString(post_err));
         fflush(stderr);
     }
 
