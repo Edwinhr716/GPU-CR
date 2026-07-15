@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vector>
 #include <thread>
+#include <set>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -221,6 +222,17 @@ double ckpt() {
     return tot_size;
 }
 
+bool find_containing_allocation(void* ptr, void** base_ptr, size_t* alloc_size) {
+    for (auto const& [alloc_ptr, size] : allocated_memory) {
+        if (ptr >= alloc_ptr && (char*)ptr < (char*)alloc_ptr + size) {
+            *base_ptr = alloc_ptr;
+            *alloc_size = size;
+            return true;
+        }
+    }
+    return false;
+}
+
 double ckpt_selective(const selective_cr_request* req) {
     fprintf(stderr, "[vGPU-SELECTIVE-CKPT] ckpt_selective() entered, %u regions, PID=%d\n",
             req->num_regions, getpid());
@@ -257,23 +269,29 @@ double ckpt_selective(const selective_cr_request* req) {
     }
     gpu->recordEvent(event, stream);
 
+    std::set<void*> blocks_to_snapshot;
     for (uint32_t ri = 0; ri < req->num_regions; ri++) {
         void* d = req->regions[ri].ptr;
-        uint64_t orig_size = req->regions[ri].size;
-
-        auto it = allocated_memory.find(d);
-        if (it == allocated_memory.end()) {
-            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] WARNING: ptr %p not in allocated_memory, skipping\n", d);
-            continue;
+        void* base_ptr = nullptr;
+        size_t alloc_size = 0;
+        if (find_containing_allocation(d, &base_ptr, &alloc_size)) {
+            blocks_to_snapshot.insert(base_ptr);
+        } else {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] WARNING: ptr %p not in any allocated memory block, skipping\n", d);
         }
+    }
 
-        uint64_t size = ROUND_UP_2MB(orig_size);
+    for (void* base_ptr : blocks_to_snapshot) {
+        auto it = allocated_memory.find(base_ptr);
+        assert(it != allocated_memory.end());
+        size_t alloc_size = it->second;
+        uint64_t size = ROUND_UP_2MB(alloc_size);
         tot_size += size;
 
-        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Region %u: ptr=%p size=%lu (aligned=%lu)\n",
-                ri, d, orig_size, size);
+        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Saving VMM block: base_ptr=%p size=%lu (aligned=%lu)\n",
+                base_ptr, alloc_size, size);
 
-        fs->files[fs->file_num].ptr = d;
+        fs->files[fs->file_num].ptr = base_ptr;
         fs->files[fs->file_num].start_offset = fs->current_offset;
         fs->files[fs->file_num].size = size;
         fs->current_offset += size;
@@ -289,6 +307,7 @@ double ckpt_selective(const selective_cr_request* req) {
             exit(-1);
         }
 
+        void* d = base_ptr;
         while (size > 0) {
             size_t cur_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
             void* start_addr = (char*)staging_buf[current_buf & 1] + buf_offset;
