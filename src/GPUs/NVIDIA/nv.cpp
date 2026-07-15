@@ -299,14 +299,22 @@ int nv::popContext() {
 // ========== hook functions implementation ==========
 
 extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
-    fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu\n", size);
+    CUcontext curr_ctx = nullptr;
+    cuCtxGetCurrent(&curr_ctx);
+    fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu, current ctx=%p\n", size, curr_ctx);
     fflush(stderr);
 
+    cudaError_t pre_err = cudaPeekAtLastError();
+    if (pre_err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaMalloc: pre-existing error (peek): %d (%s)\n", pre_err, cudaGetErrorString(pre_err));
+        fflush(stderr);
+    }
+
     if (g_pytorch_context == nullptr) {
-        CUcontext curr_ctx = nullptr;
-        if (cuCtxGetCurrent(&curr_ctx) == CUDA_SUCCESS && curr_ctx != nullptr) {
+        if (curr_ctx != nullptr) {
             g_pytorch_context = curr_ctx;
             fprintf(stderr, "[HOOK] Captured PyTorch CUDA context (fallback): %p\n", g_pytorch_context);
+            fflush(stderr);
         }
     }
 
@@ -432,6 +440,12 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
     
     fprintf(stderr, "[HOOK] cudaMalloc(%zu) => %p (VMM, aligned to %zu)\n", size, ptr, aligned_size);
     fflush(stderr);
+
+    cudaError_t post_err = cudaPeekAtLastError();
+    if (post_err != cudaSuccess) {
+        fprintf(stderr, "[HOOK] cudaMalloc: post-op error (peek): %d (%s)\n", post_err, cudaGetErrorString(post_err));
+        fflush(stderr);
+    }
     
     return cudaSuccess;
 }
