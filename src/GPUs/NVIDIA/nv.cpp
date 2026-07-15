@@ -209,6 +209,30 @@ int nv::remapPhysicalMemory(void* ptr, size_t size) {
         return -1;
     }
     
+    // If it is already mapped, release the old physical memory first
+    auto handle_it = global_handle_map.find(ptr);
+    if (handle_it != global_handle_map.end()) {
+        fprintf(stderr, "[NVIDIA] Pointer %p is already mapped, releasing old physical memory first...\n", ptr);
+        size_t old_size = it->second;
+        size_t old_aligned_size = ROUND_UP_2MB(old_size);
+        CUdeviceptr cuptr = (CUdeviceptr)ptr;
+        CUresult res = cuMemUnmap(cuptr, old_aligned_size);
+        if (res != CUDA_SUCCESS) {
+            const char* errorStr;
+            cuGetErrorString(res, &errorStr);
+            fprintf(stderr, "[NVIDIA] cuMemUnmap failed during remap: %s\n", errorStr);
+            return -1;
+        }
+        res = cuMemRelease(handle_it->second);
+        if (res != CUDA_SUCCESS) {
+            const char* errorStr;
+            cuGetErrorString(res, &errorStr);
+            fprintf(stderr, "[NVIDIA] cuMemRelease failed during remap: %s\n", errorStr);
+            return -1;
+        }
+        global_handle_map.erase(handle_it);
+    }
+
     // All allocations now use VMM, so we can remap for all
     size_t aligned_size = ROUND_UP_2MB(size);
     CUdeviceptr cuptr = (CUdeviceptr)ptr;
