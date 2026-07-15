@@ -711,6 +711,7 @@ void cr_signal_handler(int signum) {
     }
 
     uint32_t msg = comm->recv_msg();
+    gpu->pushContext();
     if(msg == SELECTIVE_CKPT_MSG) {
         ShareMemComm* scomm = (ShareMemComm*)comm;
         const selective_cr_request* req = &scomm->control->selective_req;
@@ -772,6 +773,7 @@ void cr_signal_handler(int signum) {
 #endif
         fprintf(stderr, "finish restore\n");
     }
+    gpu->popContext();
     comm->send_msg(FINISH_MSG);
 }
 

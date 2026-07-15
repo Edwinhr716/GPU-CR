@@ -15,6 +15,7 @@ std::map<void*, int> allocated_memory_type;  // 0=cudaMalloc, 1=VMM
 
 // Global handle map for all VMM allocations (both from hook and nv::allocate)
 static std::map<void*, CUmemGenericAllocationHandle> global_handle_map;
+static CUcontext g_pytorch_context = nullptr;
 
 // P2P peer access hooks and helpers live in src/ipc_hooks.cpp (canonical).
 
@@ -263,11 +264,57 @@ int nv::externalRestore(int pid) {
     return externalCheckpoint(pid);
 }
 
+int nv::pushContext() {
+    ensureCudaInitialized();
+    CUcontext target_context = context_;
+    if (g_pytorch_context != nullptr) {
+        target_context = g_pytorch_context;
+        fprintf(stderr, "[NVIDIA] Pushing captured PyTorch context: %p\n", target_context);
+    } else {
+        fprintf(stderr, "[NVIDIA] Pushing default context: %p\n", target_context);
+    }
+    CUresult res = cuCtxPushCurrent(target_context);
+    if (res != CUDA_SUCCESS) {
+        const char* errorStr;
+        cuGetErrorString(res, &errorStr);
+        fprintf(stderr, "[NVIDIA] cuCtxPushCurrent failed: %s\n", errorStr);
+        return -1;
+    }
+    return 0;
+}
+
+int nv::popContext() {
+    CUcontext popped;
+    CUresult res = cuCtxPopCurrent(&popped);
+    if (res != CUDA_SUCCESS) {
+        const char* errorStr;
+        cuGetErrorString(res, &errorStr);
+        fprintf(stderr, "[NVIDIA] cuCtxPopCurrent failed: %s\n", errorStr);
+        return -1;
+    }
+    fprintf(stderr, "[NVIDIA] Popped context: %p\n", popped);
+    return 0;
+}
+
 // ========== hook functions implementation ==========
 
 extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
     fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu\n", size);
     fflush(stderr);
+
+    if (g_pytorch_context == nullptr) {
+        CUcontext curr_ctx = nullptr;
+        if (cuCtxGetCurrent(&curr_ctx) == CUDA_SUCCESS && curr_ctx != nullptr) {
+            g_pytorch_context = curr_ctx;
+            fprintf(stderr, "[HOOK] Captured PyTorch CUDA context (fallback): %p\n", g_pytorch_context);
+        }
+    }
+
+    if (size == 0) {
+        fprintf(stderr, "[HOOK] cudaMalloc(0) -> returning nullptr and cudaSuccess\n");
+        *devPtr = nullptr;
+        return cudaSuccess;
+    }
 
     nv* gpu_instance = nullptr;
 
@@ -303,6 +350,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return cudaErrorInitializationError;
             }
             fprintf(stderr, "[HOOK] Using existing context, device=%d\n", device);
+            g_pytorch_context = context;
         } else {
             res = cuDeviceGet(&device, 0);
             if (res != CUDA_SUCCESS) {
@@ -319,6 +367,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return cudaErrorInitializationError;
             }
             fprintf(stderr, "[HOOK] Created new context, device=%d\n", device);
+            g_pytorch_context = context;
         }
     }
     
