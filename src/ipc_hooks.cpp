@@ -672,9 +672,13 @@ typedef CUresult (*cuLaunchKernel_fn)(CUfunction, unsigned int, unsigned int, un
 
 static cudaLaunchKernel_fn real_cudaLaunchKernel = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel = nullptr;
+static cudaLaunchKernel_fn real_cudaLaunchKernel_ptsz = nullptr;
+static cuLaunchKernel_fn real_cuLaunchKernel_ptsz = nullptr;
 
 extern "C" cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
 extern "C" CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
+extern "C" cudaError_t cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream);
+extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
 
 static HookEntry g_hook_table[] = {
     {"cuMemCreate",                    (void*)hook_cuMemCreate,                    (void**)&real_cuMemCreate},
@@ -686,6 +690,8 @@ static HookEntry g_hook_table[] = {
     {"cuMemSetAccess",                 (void*)hook_cuMemSetAccess,                 (void**)&real_cuMemSetAccess},
     {"cudaLaunchKernel",               (void*)(cudaLaunchKernel_fn)cudaLaunchKernel, (void**)&real_cudaLaunchKernel},
     {"cuLaunchKernel",                 (void*)(cuLaunchKernel_fn)cuLaunchKernel,     (void**)&real_cuLaunchKernel},
+    {"cudaLaunchKernel_ptsz",          (void*)(cudaLaunchKernel_fn)cudaLaunchKernel_ptsz, (void**)&real_cudaLaunchKernel_ptsz},
+    {"cuLaunchKernel_ptsz",            (void*)(cuLaunchKernel_fn)cuLaunchKernel_ptsz,     (void**)&real_cuLaunchKernel_ptsz},
     {nullptr, nullptr, nullptr}
 };
 
@@ -891,6 +897,34 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned in
     }
     if (real_cuLaunchKernel) {
         return real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+    }
+    return CUDA_ERROR_UNKNOWN;
+}
+
+cudaError_t cudaLaunchKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream) {
+    CUcontext ctx = nullptr;
+    cuCtxGetCurrent(&ctx);
+    fprintf(stderr, "[HOOK] cudaLaunchKernel_ptsz: current ctx=%p\n", ctx);
+    fflush(stderr);
+    if (!real_cudaLaunchKernel_ptsz) {
+        real_cudaLaunchKernel_ptsz = (cudaLaunchKernel_fn)dlsym(RTLD_NEXT, "cudaLaunchKernel_ptsz");
+    }
+    if (real_cudaLaunchKernel_ptsz) {
+        return real_cudaLaunchKernel_ptsz(func, gridDim, blockDim, args, sharedMem, stream);
+    }
+    return cudaErrorUnknown;
+}
+
+CUresult CUDAAPI cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
+    CUcontext ctx = nullptr;
+    cuCtxGetCurrent(&ctx);
+    fprintf(stderr, "[HOOK] cuLaunchKernel_ptsz: current ctx=%p\n", ctx);
+    fflush(stderr);
+    if (!real_cuLaunchKernel_ptsz) {
+        real_cuLaunchKernel_ptsz = (cuLaunchKernel_fn)dlsym(RTLD_NEXT, "cuLaunchKernel_ptsz");
+    }
+    if (real_cuLaunchKernel_ptsz) {
+        return real_cuLaunchKernel_ptsz(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
     }
     return CUDA_ERROR_UNKNOWN;
 }
