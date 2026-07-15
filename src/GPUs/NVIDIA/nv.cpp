@@ -300,6 +300,7 @@ int nv::popContext() {
 // ========== hook functions implementation ==========
 
 extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     CUcontext curr_ctx = nullptr;
     cuCtxGetCurrent(&curr_ctx);
     fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu, current ctx=%p\n", size, curr_ctx);
@@ -440,6 +441,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
 }
 
 extern "C" cudaError_t cudaFree(void* ptr) {
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     fprintf(stderr, "[HOOK] cudaFree(%p)\n", ptr);
     fflush(stderr);
     

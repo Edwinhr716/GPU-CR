@@ -17,6 +17,7 @@
 #include <map>
 #include <utility>
 #include <atomic>
+#include <mutex>
 
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 #define ROUND_UP_2MB(x) (((x) + (2 * 1024 * 1024 - 1)) & ~(2 * 1024 * 1024 - 1))
@@ -61,6 +62,8 @@ extern std::map<void*, size_t> allocated_memory;
 
 // Global memory type tracking: ptr -> type (0=runtime Malloc, 1=VMM)
 extern std::map<void*, int> allocated_memory_type;
+
+extern std::mutex gpu_mem_mutex;
 
 // Helper function declarations
 void memcpy_multi(void* dest, void* src, size_t size);

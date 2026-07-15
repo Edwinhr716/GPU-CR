@@ -34,6 +34,7 @@ static void*  g_local_alloc_data_buf  = nullptr;
 static size_t g_local_alloc_data_size = 0;
 
 std::mutex fs_mutex;
+std::mutex gpu_mem_mutex;
 Comm *comm;
 Backend *backend;
 GPU *gpu;
@@ -78,6 +79,7 @@ double ckpt() {
     size_t des_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
     
     fs_mutex.lock();
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     
     fs->file_num = 0;
     fs->current_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
@@ -236,6 +238,7 @@ double ckpt_selective(const selective_cr_request* req) {
     size_t des_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
 
     fs_mutex.lock();
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
 
     fs->file_num = 0;
     fs->current_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
@@ -381,6 +384,7 @@ double ckpt_selective(const selective_cr_request* req) {
 }
 
 double restore_ptr_and_content() {
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     double tot_size = 0;
     
     long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
@@ -499,6 +503,7 @@ double restore_ptr_and_content() {
 }
 
 double restore_ptr_and_content_selective() {
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     double tot_size = 0;
 
     long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
