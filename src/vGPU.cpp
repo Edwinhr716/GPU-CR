@@ -674,6 +674,22 @@ void init_CR() {
 
     fprintf(stderr, "[init_CR] Starting CR initialization...\n");
     int id = get_id();
+
+    // Write PID -> ID mapping file
+    const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
+    if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
+    char map_name[512];
+    snprintf(map_name, sizeof(map_name), "%s/pid_map_%d", ctl_dir, getpid());
+    FILE* f_map = fopen(map_name, "w");
+    if (f_map) {
+        fprintf(f_map, "%d\n", id);
+        fclose(f_map);
+        chmod(map_name, 0666);
+        fprintf(stderr, "[init_CR] Written PID map: %s -> %d\n", map_name, id);
+    } else {
+        perror("[init_CR] Failed to open PID map file for writing");
+    }
+
     comm = new ShareMemComm(getpid());
     comm->setup();
     backend = new ShareMem(id);
