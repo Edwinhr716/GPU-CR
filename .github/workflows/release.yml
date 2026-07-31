@@ -23,21 +23,9 @@ jobs:
             cmake build-essential git ca-certificates
           rm -rf /var/lib/apt/lists/*
 
-      - name: Configure CMake
+      - name: Build Release Artifacts via Makefile
         run: |
-          cmake -B build -S . \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGPU_VENDOR=NVIDIA
-
-      - name: Build Targets
-        run: |
-          cmake --build build --config Release --target vGPU cr_client -j$(nproc)
-
-      - name: Generate Checksums
-        working-directory: build
-        run: |
-          sha256sum cr_client vGPU-NVIDIA.so > checksums.sha256
-          cat checksums.sha256
+          make release-local
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

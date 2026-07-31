@@ -6,11 +6,13 @@ BUILD_DIR  ?= build
 DIST_DIR   ?= dist
 CUDA_IMAGE ?= nvidia/cuda:12.2.2-devel-ubuntu22.04
 
-.PHONY: all build clean release-artifacts release-local
+.PHONY: all build clean release release-artifacts release-local
 
-all: release-local
+all: release
 
-# 1. Reproducible build inside a Docker container (matches GitHub Actions environment)
+release: release-local
+
+# 1. Reproducible build inside a Docker container (for host environments without CUDA)
 release-artifacts:
 	@echo "Building reproducible release artifacts in Docker ($(CUDA_IMAGE))..."
 	@mkdir -p $(DIST_DIR)
@@ -27,10 +29,13 @@ release-artifacts:
 	@echo "Success: Release artifacts placed in $(CURDIR)/$(DIST_DIR)/:"
 	@ls -lh $(DIST_DIR)/
 
-# 2. Local CMake build (requires local CUDA + CMake installation)
+# 2. Local CMake build and checksum generation (used by GitHub Actions and local CUDA environments)
 release-local:
 	cmake -B $(BUILD_DIR) -S . -DCMAKE_BUILD_TYPE=Release -DGPU_VENDOR=$(GPU_VENDOR)
 	cmake --build $(BUILD_DIR) --config Release --target vGPU cr_client -j$$(nproc)
+	cd $(BUILD_DIR) && sha256sum cr_client vGPU-$(GPU_VENDOR).so > checksums.sha256
+	@echo "Build complete. Artifacts in $(BUILD_DIR)/:"
+	@ls -lh $(BUILD_DIR)/cr_client $(BUILD_DIR)/vGPU-$(GPU_VENDOR).so $(BUILD_DIR)/checksums.sha256
 
 clean:
 	rm -rf $(BUILD_DIR) $(DIST_DIR)
