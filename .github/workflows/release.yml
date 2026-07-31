@@ -1,0 +1,50 @@
+name: Build and Release GPU-CR Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.2.2-devel-ubuntu22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            cmake build-essential git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGPU_VENDOR=NVIDIA
+
+      - name: Build Targets
+        run: |
+          cmake --build build --config Release --target vGPU cr_client -j$(nproc)
+
+      - name: Generate Checksums
+        working-directory: build
+        run: |
+          sha256sum cr_client vGPU-NVIDIA.so > checksums.sha256
+          cat checksums.sha256
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            build/cr_client
+            build/vGPU-NVIDIA.so
+            build/checksums.sha256
+          generate_release_notes: true

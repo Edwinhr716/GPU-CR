@@ -9,7 +9,7 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 CTestTestfile.cmake
-Makefile
+# Makefile
 
 # Object files & libraries
 *.o
