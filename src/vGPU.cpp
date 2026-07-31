@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vector>
 #include <thread>
+#include <set>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -34,6 +35,7 @@ static void*  g_local_alloc_data_buf  = nullptr;
 static size_t g_local_alloc_data_size = 0;
 
 std::mutex fs_mutex;
+std::mutex gpu_mem_mutex;
 Comm *comm;
 Backend *backend;
 GPU *gpu;
@@ -78,6 +80,7 @@ double ckpt() {
     size_t des_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
     
     fs_mutex.lock();
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     
     fs->file_num = 0;
     fs->current_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
@@ -219,7 +222,188 @@ double ckpt() {
     return tot_size;
 }
 
+bool find_containing_allocation(void* ptr, void** base_ptr, size_t* alloc_size) {
+    for (auto const& [alloc_ptr, size] : allocated_memory) {
+        if (ptr >= alloc_ptr && (char*)ptr < (char*)alloc_ptr + size) {
+            *base_ptr = alloc_ptr;
+            *alloc_size = size;
+            return true;
+        }
+    }
+    return false;
+}
+
+double ckpt_selective(const selective_cr_request* req) {
+    fprintf(stderr, "[vGPU-SELECTIVE-CKPT] ckpt_selective() entered, %u regions, PID=%d\n",
+            req->num_regions, getpid());
+    fflush(stderr);
+
+    double tot_size = 0;
+
+    auto time_start = std::chrono::high_resolution_clock::now();
+    long sync_time = 0, cpu_copy_time = 0, release_time = 0;
+
+    void* tmp_buf = backend->get_tmp_buf();
+    shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
+    int current_buf = 0;
+    size_t buf_offset = 0;
+    size_t des_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
+
+    fs_mutex.lock();
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+
+    fs->file_num = 0;
+    fs->current_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
+
+    GPUStream stream;
+    GPUEvent event;
+    if (gpu->createStream(&stream) != 0) {
+        fprintf(stderr, "Error: Failed to create stream\n");
+        fs_mutex.unlock();
+        exit(-1);
+    }
+    if (gpu->createEvent(&event) != 0) {
+        fprintf(stderr, "Error: Failed to create event\n");
+        fs_mutex.unlock();
+        exit(-1);
+    }
+    gpu->recordEvent(event, stream);
+
+    std::set<void*> blocks_to_snapshot;
+    for (uint32_t ri = 0; ri < req->num_regions; ri++) {
+        void* d = req->regions[ri].ptr;
+        void* base_ptr = nullptr;
+        size_t alloc_size = 0;
+        if (find_containing_allocation(d, &base_ptr, &alloc_size)) {
+            blocks_to_snapshot.insert(base_ptr);
+        } else {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] WARNING: ptr %p not in any allocated memory block, skipping\n", d);
+        }
+    }
+
+    for (void* base_ptr : blocks_to_snapshot) {
+        auto it = allocated_memory.find(base_ptr);
+        assert(it != allocated_memory.end());
+        size_t alloc_size = it->second;
+        uint64_t size = ROUND_UP_2MB(alloc_size);
+        tot_size += size;
+
+        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Saving VMM block: base_ptr=%p size=%lu (aligned=%lu)\n",
+                base_ptr, alloc_size, size);
+
+        fs->files[fs->file_num].ptr = base_ptr;
+        fs->files[fs->file_num].start_offset = fs->current_offset;
+        fs->files[fs->file_num].size = size;
+        fs->current_offset += size;
+        if (fs->current_offset > SHM_SIZE) {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: Not enough space in shared memory\n");
+            fs_mutex.unlock();
+            exit(-1);
+        }
+        fs->file_num++;
+        if (fs->file_num >= MAX_FILE_NUM) {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: Too many files in shared memory fs\n");
+            fs_mutex.unlock();
+            exit(-1);
+        }
+
+        void* d = base_ptr;
+        while (size > 0) {
+            size_t cur_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
+            void* start_addr = (char*)staging_buf[current_buf & 1] + buf_offset;
+
+            if (gpu->memcpyAsync(start_addr, d, cur_size, GPUMemcpyKind::DeviceToHost, stream) != 0) {
+                fprintf(stderr, "Error: memcpyAsync failed\n");
+                fs_mutex.unlock();
+                exit(-1);
+            }
+
+            buf_offset += cur_size;
+            d = (char*)d + cur_size;
+            size -= cur_size;
+            if (buf_offset >= STAGING_BUF_SIZE) {
+                assert(buf_offset == STAGING_BUF_SIZE);
+                if (current_buf > 0) {
+                    auto t3 = std::chrono::high_resolution_clock::now();
+                    gpu->synchronizeEvent(event);
+                    auto t4 = std::chrono::high_resolution_clock::now();
+                    sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
+
+                    auto t5 = std::chrono::high_resolution_clock::now();
+                    memcpy_multi((char*)fs + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
+                    auto t6 = std::chrono::high_resolution_clock::now();
+                    cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
+
+                    des_offset += STAGING_BUF_SIZE;
+                }
+                buf_offset = 0;
+                current_buf++;
+                gpu->recordEvent(event, stream);
+            }
+        }
+    }
+
+    if (current_buf > 0) {
+        auto t3 = std::chrono::high_resolution_clock::now();
+        gpu->synchronizeEvent(event);
+        auto t4 = std::chrono::high_resolution_clock::now();
+        sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
+
+        auto t5 = std::chrono::high_resolution_clock::now();
+        memcpy_multi((char*)fs + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
+        auto t6 = std::chrono::high_resolution_clock::now();
+        cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
+
+        des_offset += STAGING_BUF_SIZE;
+    }
+
+    auto t7 = std::chrono::high_resolution_clock::now();
+    gpu->synchronizeStream(stream);
+    auto t8 = std::chrono::high_resolution_clock::now();
+    sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
+
+    auto t9 = std::chrono::high_resolution_clock::now();
+    memcpy_multi((char*)fs + des_offset, staging_buf[current_buf & 1], buf_offset);
+    auto t10 = std::chrono::high_resolution_clock::now();
+    cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t10 - t9).count();
+
+    assert(des_offset + buf_offset == fs->current_offset);
+    gpu->destroyStream(stream);
+    gpu->destroyEvent(event);
+
+    fprintf(stderr, "Releasing physical GPU memory for %lu selective regions...\n", (unsigned long)fs->file_num);
+    auto t11 = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < fs->file_num; i++) {
+        void* ptr = fs->files[i].ptr;
+        if (gpu->releasePhysicalMemory(ptr) != 0) {
+            fprintf(stderr, "Error: Failed to release physical memory for ptr %p\n", ptr);
+            fs_mutex.unlock();
+            exit(-1);
+        }
+    }
+    auto t12 = std::chrono::high_resolution_clock::now();
+    release_time = std::chrono::duration_cast<std::chrono::microseconds>(t12 - t11).count();
+    fprintf(stderr, "Physical GPU memory released for selective regions, virtual addresses preserved\n");
+
+    fprintf(stderr, "=== Selective Checkpoint Timing Breakdown ===\n");
+    fprintf(stderr, "  Regions:          %6lu\n", (unsigned long)fs->file_num);
+    fprintf(stderr, "  GPU sync:         %6ld ms\n", sync_time / 1000);
+    fprintf(stderr, "  CPU memcpy:       %6ld ms (%.2f GB/s)\n",
+            cpu_copy_time / 1000,
+            tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (cpu_copy_time / 1000000.0) : 0.0);
+    fprintf(stderr, "  Release memory:   %6ld ms\n", release_time / 1000);
+    long data_transfer_time = sync_time + cpu_copy_time;
+    fprintf(stderr, "  Data transfer:    %6ld ms (%.2f GB/s)\n",
+            data_transfer_time / 1000,
+            tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (data_transfer_time / 1000000.0) : 0.0);
+    fprintf(stderr, "===============================================\n");
+
+    fs_mutex.unlock();
+    return tot_size;
+}
+
 double restore_ptr_and_content() {
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     double tot_size = 0;
     
     long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
@@ -337,6 +521,125 @@ double restore_ptr_and_content() {
     return tot_size;
 }
 
+double restore_ptr_and_content_selective() {
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+    double tot_size = 0;
+
+    long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
+
+    void* tmp_buf = backend->get_tmp_buf();
+    shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
+
+    uint64_t file_num = fs->file_num;
+    fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] restore %lu selective regions\n", file_num);
+
+    fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Remapping physical GPU memory...\n");
+    auto t1 = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < file_num; i++) {
+        void* ptr = fs->files[i].ptr;
+        uint64_t size = fs->files[i].size;
+        if (gpu->remapPhysicalMemory(ptr, size) != 0) {
+            fprintf(stderr, "Error: Failed to remap physical memory for ptr %p\n", ptr);
+            exit(-1);
+        }
+    }
+    auto t2 = std::chrono::high_resolution_clock::now();
+    remap_time = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+    fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Physical GPU memory remapped\n");
+
+    GPUStream stream;
+    GPUEvent event;
+    if (gpu->createStream(&stream) != 0) {
+        fprintf(stderr, "Error: Failed to create stream\n");
+        exit(-1);
+    }
+    if (gpu->createEvent(&event) != 0) {
+        fprintf(stderr, "Error: Failed to create event\n");
+        exit(-1);
+    }
+    gpu->recordEvent(event, stream);
+
+    int current_buf = 0;
+    size_t buf_offset = 0;
+    size_t src_offset = 0;
+
+    for (uint64_t i = 0; i < file_num; i++) {
+        void* requestedAddr = fs->files[i].ptr;
+        uint64_t offset = fs->files[i].start_offset;
+        uint64_t size = fs->files[i].size;
+        tot_size += size;
+
+        if (i == 0) {
+            src_offset = fs->files[i].start_offset;
+            size_t cpu_copy_size = std::min((size_t)(fs->current_offset - src_offset), (size_t)STAGING_BUF_SIZE);
+            auto tc1 = std::chrono::high_resolution_clock::now();
+            memcpy_multi(staging_buf[current_buf & 1], (char*)fs + src_offset, cpu_copy_size);
+            auto tc2 = std::chrono::high_resolution_clock::now();
+            cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(tc2 - tc1).count();
+            buf_offset = 0;
+        }
+
+        while (size > 0) {
+            size_t this_copy_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
+            assert(buf_offset == offset - src_offset);
+
+            if (gpu->memcpyAsync(requestedAddr, (char*)staging_buf[current_buf & 1] + (offset - src_offset),
+                               this_copy_size, GPUMemcpyKind::HostToDevice, stream) != 0) {
+                fprintf(stderr, "Error: memcpyAsync failed\n");
+                exit(-1);
+            }
+
+            buf_offset += this_copy_size;
+            offset += this_copy_size;
+            requestedAddr = (char*)requestedAddr + this_copy_size;
+            size -= this_copy_size;
+
+            if (buf_offset >= STAGING_BUF_SIZE) {
+                assert(buf_offset == STAGING_BUF_SIZE);
+                src_offset += STAGING_BUF_SIZE;
+                size_t cpu_copy_size = std::min((size_t)(fs->current_offset - src_offset), (size_t)STAGING_BUF_SIZE);
+
+                auto ts1 = std::chrono::high_resolution_clock::now();
+                gpu->synchronizeEvent(event);
+                auto ts2 = std::chrono::high_resolution_clock::now();
+                sync_time += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
+
+                auto tc3 = std::chrono::high_resolution_clock::now();
+                memcpy_multi(staging_buf[(current_buf + 1) & 1], (char*)fs + src_offset, cpu_copy_size);
+                auto tc4 = std::chrono::high_resolution_clock::now();
+                cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(tc4 - tc3).count();
+
+                buf_offset = 0;
+                current_buf++;
+                gpu->recordEvent(event, stream);
+            }
+        }
+    }
+
+    auto ts3 = std::chrono::high_resolution_clock::now();
+    gpu->synchronizeStream(stream);
+    auto ts4 = std::chrono::high_resolution_clock::now();
+    sync_time += std::chrono::duration_cast<std::chrono::microseconds>(ts4 - ts3).count();
+
+    gpu->destroyStream(stream);
+    gpu->destroyEvent(event);
+
+    fprintf(stderr, "=== Selective Restore Timing Breakdown ===\n");
+    fprintf(stderr, "  Regions:          %6lu\n", file_num);
+    fprintf(stderr, "  Remap memory:     %6ld ms\n", remap_time / 1000);
+    fprintf(stderr, "  CPU memcpy:       %6ld ms (%.2f GB/s)\n",
+            cpu_copy_time / 1000,
+            tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (cpu_copy_time / 1000000.0) : 0.0);
+    fprintf(stderr, "  GPU sync:         %6ld ms\n", sync_time / 1000);
+    long data_transfer_time = cpu_copy_time + sync_time;
+    fprintf(stderr, "  Data transfer:    %6ld ms (%.2f GB/s)\n",
+            data_transfer_time / 1000,
+            tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (data_transfer_time / 1000000.0) : 0.0);
+    fprintf(stderr, "============================================\n");
+
+    return tot_size;
+}
+
 int get_id() {
     char id_name[512];
     const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
@@ -371,6 +674,22 @@ void init_CR() {
 
     fprintf(stderr, "[init_CR] Starting CR initialization...\n");
     int id = get_id();
+
+    // Write PID -> ID mapping file
+    const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
+    if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
+    char map_name[512];
+    snprintf(map_name, sizeof(map_name), "%s/pid_map_%d", ctl_dir, getpid());
+    FILE* f_map = fopen(map_name, "w");
+    if (f_map) {
+        fprintf(f_map, "%d\n", id);
+        fclose(f_map);
+        chmod(map_name, 0666);
+        fprintf(stderr, "[init_CR] Written PID map: %s -> %d\n", map_name, id);
+    } else {
+        perror("[init_CR] Failed to open PID map file for writing");
+    }
+
     comm = new ShareMemComm(getpid());
     comm->setup();
     backend = new ShareMem(id);
@@ -432,7 +751,30 @@ void cr_signal_handler(int signum) {
     }
 
     uint32_t msg = comm->recv_msg();
-    if(msg == CKPT_MSG) {
+    gpu->pushContext();
+    if(msg == SELECTIVE_CKPT_MSG) {
+        ShareMemComm* scomm = (ShareMemComm*)comm;
+        const selective_cr_request* req = &scomm->control->selective_req;
+        fprintf(stderr, "waiting for kernels to finish...\n");
+        gpu->syncAllKernels();
+        fprintf(stderr, "start selective ckpt (%u regions)...\n", req->num_regions);
+        auto start = std::chrono::high_resolution_clock::now();
+        double tot_size = ckpt_selective(req);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        fprintf(stderr, "selective ckpt size: %f GB, time: %ld ms, bw: %f GB/s\n",
+               tot_size / 1024 / 1024 / 1024, duration.count(),
+               duration.count() > 0 ? tot_size / duration.count() * 1000 / 1024 / 1024 / 1024 : 0.0);
+    } else if(msg == SELECTIVE_RESTORE_MSG) {
+        fprintf(stderr, "start selective restore...\n");
+        auto start = std::chrono::high_resolution_clock::now();
+        double tot_size = restore_ptr_and_content_selective();
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        fprintf(stderr, "selective restore size: %f GB, time: %ld ms, bw: %f GB/s\n",
+               tot_size / 1024 / 1024 / 1024, duration.count(),
+               duration.count() > 0 ? tot_size / duration.count() * 1000 / 1024 / 1024 / 1024 : 0.0);
+    } else if(msg == CKPT_MSG) {
         fprintf(stderr, "waiting for kernels to finish...\n");
         gpu->syncAllKernels();
         fprintf(stderr, "start ckpt...\n");
@@ -471,6 +813,7 @@ void cr_signal_handler(int signum) {
 #endif
         fprintf(stderr, "finish restore\n");
     }
+    gpu->popContext();
     comm->send_msg(FINISH_MSG);
 }
 

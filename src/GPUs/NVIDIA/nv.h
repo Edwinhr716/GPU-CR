@@ -44,6 +44,9 @@ public:
     int externalCheckpoint(int pid) override;
     int externalRestore(int pid) override;
     
+    int pushContext() override;
+    int popContext() override;
+    
     GPUVendor getVendor() const override { return GPUVendor::NVIDIA; }
     std::string getVendorName() const override { return "NVIDIA"; }
 };

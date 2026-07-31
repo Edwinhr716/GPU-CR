@@ -17,6 +17,7 @@
 #include <map>
 #include <utility>
 #include <atomic>
+#include <mutex>
 
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 #define ROUND_UP_2MB(x) (((x) + (2 * 1024 * 1024 - 1)) & ~(2 * 1024 * 1024 - 1))
@@ -62,6 +63,8 @@ extern std::map<void*, size_t> allocated_memory;
 // Global memory type tracking: ptr -> type (0=runtime Malloc, 1=VMM)
 extern std::map<void*, int> allocated_memory_type;
 
+extern std::mutex gpu_mem_mutex;
+
 // Helper function declarations
 void memcpy_multi(void* dest, void* src, size_t size);
 
@@ -77,8 +80,21 @@ struct shared_mem_fs {
     struct shared_mem_file files[MAX_FILE_NUM];
 };
 
+#define MAX_SELECTIVE_REGIONS 4096
+
+struct selective_cr_region {
+    void* ptr;
+    uint64_t size;
+};
+
+struct selective_cr_request {
+    uint32_t num_regions;
+    struct selective_cr_region regions[MAX_SELECTIVE_REGIONS];
+};
+
 struct signal_controls {
     uint32_t signal;
+    struct selective_cr_request selective_req;
 };
 
 #endif

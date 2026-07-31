@@ -41,6 +41,40 @@ std::string get_cuda_checkpoint_path() {
 }
 
 
+static bool parse_selective_regions(const char* spec, selective_cr_request* req) {
+    req->num_regions = 0;
+    char* buf = strdup(spec);
+    char* token = strtok(buf, ",");
+    while (token) {
+        if (req->num_regions >= MAX_SELECTIVE_REGIONS) {
+            fprintf(stderr, "Error: too many selective regions (max %d)\n", MAX_SELECTIVE_REGIONS);
+            free(buf);
+            return false;
+        }
+        char* colon = strchr(token, ':');
+        if (!colon) {
+            fprintf(stderr, "Error: invalid region format '%s' (expected ptr:size)\n", token);
+            free(buf);
+            return false;
+        }
+        *colon = '\0';
+        void* ptr = (void*)strtoull(token, nullptr, 0);
+        uint64_t size = strtoull(colon + 1, nullptr, 0);
+        if (size == 0) {
+            fprintf(stderr, "Error: region size is 0 for ptr %s\n", token);
+            free(buf);
+            return false;
+        }
+        req->regions[req->num_regions].ptr = ptr;
+        req->regions[req->num_regions].size = size;
+        req->num_regions++;
+        token = strtok(nullptr, ",");
+    }
+    free(buf);
+    return req->num_regions > 0;
+}
+
+
 int main(int argc, char* argv[]) {
     int opt;
     int init = 0;
@@ -50,7 +84,8 @@ int main(int argc, char* argv[]) {
     int pid = 0;
     int criu_pid = 0;
     int buffer_only = 0;
-    while ((opt = getopt(argc, argv, "icrdbp:m:")) != -1) {
+    const char* selective_spec = nullptr;
+    while ((opt = getopt(argc, argv, "icrdbp:m:s:")) != -1) {
         switch (opt) {
             case 'i':
                 init = 1;
@@ -70,8 +105,11 @@ int main(int argc, char* argv[]) {
             case 'b':
                 buffer_only = 1;
                 break;
+            case 's':
+                selective_spec = optarg;
+                break;
             default:
-                fprintf(stderr, "Usage: %s [-i|-c|-r] -p pid [-m criu_pid] [-b]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-i|-c|-r] -p pid [-m criu_pid] [-b] [-s ptr:size,...]\n", argv[0]);
                 exit(EXIT_FAILURE);
         }
     }
@@ -86,7 +124,7 @@ int main(int argc, char* argv[]) {
     assert(pid != 0);
     if (criu_pid == 0) criu_pid = pid;
 
-    Comm *comm = new ShareMemComm(pid);
+    ShareMemComm *comm = new ShareMemComm(pid);
     comm->setup();
 
     int ret;
@@ -97,7 +135,40 @@ int main(int argc, char* argv[]) {
         while(!comm->is_finished()) {
             usleep(1000);
         }
-    }  else if(ckpt) {
+    }  else if(ckpt && selective_spec) {
+        selective_cr_request req;
+        if (!parse_selective_regions(selective_spec, &req)) {
+            fprintf(stderr, "Error: failed to parse selective regions\n");
+            exit(EXIT_FAILURE);
+        }
+        printf("Selective checkpoint: %u regions\n", req.num_regions);
+        for (uint32_t i = 0; i < req.num_regions; i++) {
+            printf("  region %u: ptr=%p size=%lu\n", i, req.regions[i].ptr, req.regions[i].size);
+        }
+        comm->control->selective_req = req;
+        comm->send_msg(SELECTIVE_CKPT_MSG);
+        kill(pid, CR_CKPT_SIGNAL);
+        printf("Selective dump signal sent.\n");
+        while(!comm->is_finished()) {
+            usleep(1000);
+        }
+        printf("Selective checkpointing done\n");
+    } else if(restore && selective_spec) {
+        selective_cr_request req;
+        if (!parse_selective_regions(selective_spec, &req)) {
+            fprintf(stderr, "Error: failed to parse selective regions\n");
+            exit(EXIT_FAILURE);
+        }
+        printf("Selective restore: %u regions\n", req.num_regions);
+        comm->control->selective_req = req;
+        comm->send_msg(SELECTIVE_RESTORE_MSG);
+        kill(pid, CR_RESTORE_SIGNAL);
+        printf("Selective restore signal sent.\n");
+        while(!comm->is_finished()) {
+            usleep(1000);
+        }
+        printf("Selective restore done\n");
+    } else if(ckpt) {
         comm->send_msg(CKPT_MSG);
         kill(pid, CR_CKPT_SIGNAL);
         printf("Dump signal sent.\n");

@@ -73,6 +73,9 @@ public:
     
     virtual int externalRestore(int pid) = 0;
     
+    virtual int pushContext() { return 0; }
+    virtual int popContext() { return 0; }
+    
     virtual GPUVendor getVendor() const = 0;
     
     virtual std::string getVendorName() const = 0;
