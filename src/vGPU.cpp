@@ -285,7 +285,11 @@ double ckpt_selective(const selective_cr_request* req) {
         auto it = allocated_memory.find(base_ptr);
         assert(it != allocated_memory.end());
         size_t alloc_size = it->second;
-        uint64_t size = ROUND_UP_2MB(alloc_size);
+        // Dump only the caller-requested allocation size, not the 2MB-rounded
+        // VMM block: the rounding padding was never handed to the application,
+        // and release/remap re-round internally (releasePhysicalMemory,
+        // remapPhysicalMemory), so physical block handling is unchanged.
+        uint64_t size = alloc_size;
         tot_size += size;
 
         fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Saving VMM block: base_ptr=%p size=%lu (aligned=%lu)\n",
