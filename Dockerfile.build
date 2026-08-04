@@ -1,0 +1,20 @@
+# Builds vGPU-NVIDIA.so from the LOCAL source tree (not the GitHub branch),
+# applying the same build-time patches the deployed prebuilt carries
+# (snapshot-agent-user-guide.md Step 2): SIGRTMAX-8/-7 signal remap and
+# control-file 0777. CPU-only; compiles against CUDA headers, no GPU needed.
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential && rm -rf /var/lib/apt/lists/*
+
+COPY . /tmp/GPU-CR
+RUN cd /tmp/GPU-CR && \
+    sed -i 's/#define CR_CKPT_SIGNAL     SIGUSR1/#define CR_CKPT_SIGNAL     (SIGRTMAX - 8)/' src/common.h && \
+    sed -i 's/#define CR_RESTORE_SIGNAL  SIGUSR2/#define CR_RESTORE_SIGNAL  (SIGRTMAX - 7)/' src/common.h && \
+    sed -i 's/int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);/int fd_control = open(control_name, O_CREAT | O_RDWR, 0777); fchmod(fd_control, 0777);/' src/comm/share_mem.cpp && \
+    grep -q "SIGRTMAX - 8" src/common.h && \
+    grep -q "0777" src/comm/share_mem.cpp && \
+    mkdir build && cd build && \
+    cmake -DGPU_VENDOR=NVIDIA .. && \
+    make -j$(nproc)
+
+FROM busybox:stable
+COPY --from=builder /tmp/GPU-CR/build/vGPU-NVIDIA.so /vGPU-NVIDIA.so
