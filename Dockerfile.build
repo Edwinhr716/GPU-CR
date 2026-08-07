@@ -1,6 +1,7 @@
 # Builds vGPU-NVIDIA.so from the LOCAL source tree (not the GitHub branch),
 # applying the same build-time patches the deployed prebuilt carries
-# (snapshot-agent-user-guide.md Step 2): SIGRTMAX-8/-7 signal remap and
+# (see docs/gke-memory-address-integration.md in llm-d-rl-time-slicing,
+# branch gcr-backend-memory-allocation): SIGRTMAX-8/-7 signal remap and
 # control-file 0777. CPU-only; compiles against CUDA headers, no GPU needed.
 FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS builder
 ARG SHM_SIZE_GB=25
