@@ -3,6 +3,7 @@
 # (snapshot-agent-user-guide.md Step 2): SIGRTMAX-8/-7 signal remap and
 # control-file 0777. CPU-only; compiles against CUDA headers, no GPU needed.
 FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS builder
+ARG SHM_SIZE_GB=25
 RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential && rm -rf /var/lib/apt/lists/*
 
 COPY . /tmp/GPU-CR
@@ -13,7 +14,7 @@ RUN cd /tmp/GPU-CR && \
     grep -q "SIGRTMAX - 8" src/common.h && \
     grep -q "0777" src/comm/share_mem.cpp && \
     mkdir build && cd build && \
-    cmake -DGPU_VENDOR=NVIDIA .. && \
+    cmake -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB=${SHM_SIZE_GB} .. && \
     make -j$(nproc)
 
 FROM busybox:stable

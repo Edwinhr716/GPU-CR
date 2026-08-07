@@ -4,6 +4,8 @@ steps:
   - build
   - -f
   - Dockerfile.build
+  - --build-arg
+  - SHM_SIZE_GB=$_SHM_SIZE_GB
   - -t
   - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/gpucr-so:$_TAG
   - .
@@ -11,6 +13,7 @@ images:
 - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/gpucr-so:$_TAG
 substitutions:
   _TAG: unrounded-v1
+  _SHM_SIZE_GB: "25"
 options:
   machineType: E2_HIGHCPU_32
   diskSizeGb: 200
