@@ -21,6 +21,9 @@
 
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 #define ROUND_UP_2MB(x) (((x) + (2 * 1024 * 1024 - 1)) & ~(2 * 1024 * 1024 - 1))
+// CUDA VMM mapping granularity: every hooked allocation is reserved/mapped in
+// units of this size (see ROUND_UP_2MB uses in the cudaMalloc hook).
+#define VMM_GRANULE_SIZE (2UL * 1024 * 1024)
 
 // SHM_SIZE: Per-GPU checkpoint buffer on hugepages.
 // Each GPU process allocates SHM_SIZE + STAGING_BUF_SIZE*STAGING_BUF_NUM.

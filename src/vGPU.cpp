@@ -61,6 +61,20 @@ void memcpy_multi(void* dest, void* src, size_t size) {
     }
 }
 
+// GEP-0005 §3: the driver rejects a cudaMemcpyAsync on a hooked VMM mapping
+// when the copy crosses a 2MB granule boundary with an unrounded length
+// (nv.cpp:133 "invalid argument" at 4B/rank-64; see
+// docs/proposals/0005-multi-handle-unrounded-dumps.md). Clamp each device
+// copy so it ends at the next granule boundary or at the region end: every
+// issued copy is <=2MB and granule-aligned at its start or its end — the
+// copy shapes validated at scale. Applies to the selective (unrounded)
+// paths only; the full-checkpoint paths copy rounded extents and never hit
+// this boundary.
+static inline size_t granule_clamp(const void* dev_ptr, size_t len) {
+    size_t to_boundary = VMM_GRANULE_SIZE - ((uintptr_t)dev_ptr & (VMM_GRANULE_SIZE - 1));
+    return len < to_boundary ? len : to_boundary;
+}
+
 
 double ckpt() {
     fprintf(stderr, "[vGPU-CKPT] ckpt() entered, PID=%d\n", getpid());
@@ -314,6 +328,7 @@ double ckpt_selective(const selective_cr_request* req) {
         void* d = base_ptr;
         while (size > 0) {
             size_t cur_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
+            cur_size = granule_clamp(d, cur_size);  // GEP-0005 §3
             void* start_addr = (char*)staging_buf[current_buf & 1] + buf_offset;
 
             if (gpu->memcpyAsync(start_addr, d, cur_size, GPUMemcpyKind::DeviceToHost, stream) != 0) {
@@ -585,6 +600,7 @@ double restore_ptr_and_content_selective() {
 
         while (size > 0) {
             size_t this_copy_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
+            this_copy_size = granule_clamp(requestedAddr, this_copy_size);  // GEP-0005 §3
             assert(buf_offset == offset - src_offset);
 
             if (gpu->memcpyAsync(requestedAddr, (char*)staging_buf[current_buf & 1] + (offset - src_offset),
