@@ -1,6 +1,7 @@
 # GEP-0005: Fix Unrounded Selective Dumps for Allocations Larger Than One VMM Handle
 
-- **Status:** provisional
+- **Status:** implemented (§3 proper fix; validated 2026-08-12, see
+  Implementation History)
 - **Authors:** @Edwinhr716 (with Claude)
 - **Creation date:** 2026-08-06
 - **Tracking:** rank-64 trainer crash 2026-08-06 (reproducer below); branch
@@ -163,3 +164,21 @@ is in CI.
   nv.cpp:133; boundary confirmed by rank-48 (max region 1.87MB) passing
   clean on the identical build; campaign pivoted to rank-48 as workaround.
 - 2026-08-06 — this proposal.
+- 2026-08-12 — §3 (granule-chunked copies) implemented: `granule_clamp()`
+  in `src/vGPU.cpp`, applied to both selective copy loops (DtoH checkpoint
+  and HtoD restore); full-checkpoint paths untouched. Built as
+  `gpucr-so:gep0005-chunked-v1`.
+- 2026-08-12 — validation on the rebuilt `dra-testing` nodepool
+  (`rl-hugepages-l4-b`, L4): Gate B at 4B/rank-64 PASS with the chunked
+  build — 1502 regions (42×2,490,368B per tenant), dump extent 1.46875 GB
+  = Σ alloc_size (unrounded win kept), 1512/1512 tensors bitwise,
+  optim-step-after-restore OK, per-checkpoint transfer within noise of the
+  unchunked build. Regression at 4B/rank-48 PASS (1501 regions). NOTE: the
+  original crash no longer reproduces on the current node image — the
+  incident-era `unrounded-v1` .so also passed rank-64 (1,278 unrounded
+  >2MB copies, zero errors). The 2026-08-06 crash node and its driver
+  stack are gone (nodepools recreated); the driver constraint appears
+  environment-specific, which is precisely why §3 makes the copy shape
+  independent of it. The unit reproducer (§1) therefore cannot currently
+  pin the boundary red→green; it should be re-armed if the failure ever
+  resurfaces on another driver.
