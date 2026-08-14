@@ -182,3 +182,25 @@ is in CI.
   independent of it. The unit reproducer (§1) therefore cannot currently
   pin the boundary red→green; it should be re-armed if the failure ever
   resurfaces on another driver.
+- 2026-08-13 — root-cause investigation (the non-goal, now partially
+  answered). Environment archaeology + a per-case-isolated CUDA probe on
+  the current node (driver 580.159.04 / CUDA 13.0 / node image
+  v1.35.6-gke.1258000) established: (1) the incident node ran node image
+  v1.35.6-gke.1250000 (booted 2026-08-06T00:25, hours before the crash);
+  the 2026-08-11 cluster upgrade replaced every node and its driver
+  bundle. (2) In the incident era `cudaHostRegister` on the hugetlbfs
+  staging buffer failed as a matter of course (nv.cpp's "expected for
+  hugepage-backed memory" comment; the interposer clears the sticky error
+  for it) — checkpoint DtoH therefore ran through the driver's
+  unpinned/bounce path. On 580.159.04 the same registration SUCCEEDS, so
+  the production copy path is now pinned DMA. (3) A 32-case probe matrix
+  (4 destination types × 8 copy shapes incl. the exact incident shape
+  from a hooked-VMM base) passes cleanly today, so the old driver's
+  constraint — VMM source × cross-granule × unaligned length, at minimum —
+  is gone or masked in the current stack. (4) One unreproduced SIGSEGV
+  was observed during a cross-granule unaligned DtoH into pageable memory
+  (1 of 36 attempts) — weak evidence the unpinned path is still fragile.
+  Conclusion: the trigger was driver-version- and pinning-state-dependent;
+  registration silently falls back to unpinned on failure, which is
+  exactly the latent condition that armed the 2026-08-06 crash. §3
+  chunking removes the dependence on both.
