@@ -60,6 +60,12 @@ constexpr int kExitTimeout = 4;
 }  // namespace
 
 std::string get_cuda_checkpoint_path() {
+    // Deployment override (also used by the GPU-free integration tests):
+    // point at the cuda-checkpoint binary explicitly instead of relying on
+    // the layout-relative lookup below.
+    const char* env_path = getenv("GPU_CR_CUDA_CHECKPOINT");
+    if (env_path && env_path[0]) return env_path;
+
     char exe_path[1024];
     ssize_t count = readlink("/proc/self/exe", exe_path, 1024);
     if (count == -1) {
@@ -504,6 +510,12 @@ int main(int argc, char* argv[]) {
         if (ret < 0) {
             perror("system()");
             exit(EXIT_FAILURE);
+        }
+        // A failed toggle leaves the process frozen with its VRAM already
+        // rewritten — surface it, never report success.
+        if (ret != 0) {
+            fprintf(stderr, "Error: '%s' exited with status %d\n", cmd.c_str(), ret);
+            exit(kExitOpFailed);
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         printf("cuda-checkpoint restore time: %.3f s\n", std::chrono::duration<double>(t1 - t0).count());
