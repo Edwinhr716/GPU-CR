@@ -1,0 +1,38 @@
+# Builds and publishes BOTH candidate images from one source snapshot:
+#   gpucr-so:$_TAG   minimal artifact carrier (vGPU-NVIDIA.so + cr_client)
+#   gpucr-e2e:$_TAG  GPU-node test image (workload + e2e/perf scripts)
+# The builder stage runs the GPU-free unit + integration suites; a red
+# suite fails this build.
+steps:
+- name: gcr.io/cloud-builders/docker
+  args:
+  - build
+  - -f
+  - Dockerfile.build
+  - --build-arg
+  - SHM_SIZE_GB=$_SHM_SIZE_GB
+  - --target
+  - e2e
+  - -t
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/gpucr-e2e:$_TAG
+  - .
+- name: gcr.io/cloud-builders/docker
+  args:
+  - build
+  - -f
+  - Dockerfile.build
+  - --build-arg
+  - SHM_SIZE_GB=$_SHM_SIZE_GB
+  - -t
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/gpucr-so:$_TAG
+  - .
+images:
+- asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/gpucr-e2e:$_TAG
+- asia-southeast1-docker.pkg.dev/$PROJECT_ID/time-slicing/gpucr-so:$_TAG
+substitutions:
+  _TAG: e1-e16-consolidated
+  _SHM_SIZE_GB: "25"
+options:
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 200
+timeout: 3600s

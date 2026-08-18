@@ -1,0 +1,19 @@
+# CI: compile the tree and run the GPU-free unit + integration suites
+# (Dockerfile.build's builder stage runs ctest). Produces no image.
+#
+#   gcloud builds submit --config cloudbuild-test.yaml .
+steps:
+- name: gcr.io/cloud-builders/docker
+  args:
+  - build
+  - -f
+  - Dockerfile.build
+  - --target
+  - builder
+  - -t
+  - gpucr-test-only
+  - .
+options:
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 200
+timeout: 3600s

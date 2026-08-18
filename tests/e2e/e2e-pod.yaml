@@ -1,0 +1,76 @@
+# One-shot GPU pod running the e2e correctness gates and the perf-regression
+# suite against upstream v0.2.1.
+#
+#   1. Build candidate (runs unit+integration suites as a gate):
+#        gcloud builds submit --config cloudbuild-so.yaml --substitutions=_TAG=<tag> .
+#   2. Build baseline once: tests/e2e/build_baseline_so.sh
+#   3. Point the images below at your registry, then:
+#        kubectl apply -f tests/e2e/e2e-pod.yaml
+#        kubectl logs -f gpu-cr-e2e
+#      Pod exits 0 only if every e2e gate AND the perf gate pass.
+#
+# Requires a node with 1 GPU and 2Mi hugepages provisioned (any pool the
+# E1-E16 experiments ran on). PERF_* sizing below fits a 16GiB-hugepage pool;
+# scale up on bigger pools for steadier bandwidth numbers.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-cr-e2e
+spec:
+  restartPolicy: Never
+  volumes:
+  - name: huge-ckpt
+    emptyDir:
+      medium: HugePages-2Mi
+  - name: ctl
+    emptyDir:
+      medium: Memory
+  - name: baseline
+    emptyDir: {}
+  initContainers:
+  - name: fetch-baseline
+    # Artifact-carrier image produced by tests/e2e/build_baseline_so.sh
+    image: asia-southeast1-docker.pkg.dev/PROJECT_ID/time-slicing/gpucr-so:baseline-e9bbb52
+    imagePullPolicy: Always
+    command: [sh, -c, "cp /vGPU-NVIDIA.so /baseline/ && cp /cr_client /baseline/"]
+    volumeMounts:
+    - {name: baseline, mountPath: /baseline}
+  containers:
+  - name: e2e
+    # e2e stage of Dockerfile.build for the candidate tag:
+    #   docker build -f Dockerfile.build --target e2e -t .../gpucr-e2e:<tag> .
+    image: asia-southeast1-docker.pkg.dev/PROJECT_ID/time-slicing/gpucr-e2e:CANDIDATE_TAG
+    imagePullPolicy: Always
+    command: [bash, -c]
+    args:
+    - |
+      set -e
+      export STORE=/mnt/huge-ckpt
+      export GPU_CR_CTL_PATH=/var/run/gpu-cr-ctl
+      /opt/gpu-cr/e2e/run_e2e.sh
+      unset GPU_CR_CTL_PATH
+      /opt/gpu-cr/e2e/perf_regression.sh \
+          --baseline-so /baseline/vGPU-NVIDIA.so \
+          --baseline-client /baseline/cr_client \
+          --candidate-so "$VGPU_SO" \
+          --candidate-client "$CR_CLIENT" \
+          --iters "${PERF_ITERS:-5}" --threshold-pct "${PERF_THRESHOLD_PCT:-15}"
+    env:
+    - {name: PERF_NUM_BUFFERS, value: "8"}
+    - {name: PERF_BUFFER_MB, value: "512"}
+    securityContext:
+      capabilities:
+        add: [SYS_PTRACE]
+    resources:
+      requests:
+        hugepages-2Mi: 16Gi
+        memory: 8Gi
+        cpu: "8"
+      limits:
+        nvidia.com/gpu: 1
+        hugepages-2Mi: 16Gi
+        memory: 8Gi
+    volumeMounts:
+    - {name: huge-ckpt, mountPath: /mnt/huge-ckpt}
+    - {name: ctl, mountPath: /var/run/gpu-cr-ctl}
+    - {name: baseline, mountPath: /baseline}
