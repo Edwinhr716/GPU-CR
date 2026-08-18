@@ -1,4 +1,5 @@
 #include "comm.h"
+#include "../ctl_path.h"
 
 Comm::Comm(pid_t pid) {
 }
@@ -28,18 +29,35 @@ ShareMemComm::~ShareMemComm() {
 
 void ShareMemComm::setup() {
     char control_name[512];
-    const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
-    if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
+    int ctl_mode = 0;
+    const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
     snprintf(control_name, sizeof(control_name), "%s/control-%d", ctl_dir, pid);
-    int fd_control = open(control_name, O_CREAT | O_RDWR, 0755);
+    // 0777: the coordinator (agent container) and the workload run as
+    // different users in different containers but share this file.
+    // Previously applied as a Dockerfile.build sed patch; now source truth.
+    fd_control = open(control_name, O_CREAT | O_RDWR, 0777);
     if (fd_control < 0) {
         perror("open()");
         exit(EXIT_FAILURE);
     }
+    fchmod(fd_control, 0777);
     // Set file size before mmap to avoid Bus error
     if (ftruncate(fd_control, HUGE_PAGE_SIZE) < 0) {
         perror("ftruncate()");
         exit(EXIT_FAILURE);
+    }
+    if (ctl_mode) {
+        // tmpfs reserves nothing at ftruncate or mmap: without this, a full
+        // ctl tmpfs surfaces as SIGBUS at the first store — worst case
+        // inside the .so's signal handler. Allocate only the stored extent;
+        // the sparse 2MiB tail keeps the legacy file layout for free.
+        // cr_client runs setup() first, so ENOSPC lands here, in the
+        // coordinator, as a clean exit.
+        int rc = posix_fallocate(fd_control, 0, (off_t)ROUND_UP_4K(sizeof(signal_controls)));
+        if (rc != 0) {
+            fprintf(stderr, "posix_fallocate(%s): %s (ctl tmpfs full?)\n", control_name, strerror(rc));
+            exit(EXIT_FAILURE);
+        }
     }
     control = (signal_controls*)mmap(NULL, HUGE_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_control, 0);
     if (control == MAP_FAILED) {

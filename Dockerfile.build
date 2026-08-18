@@ -1,0 +1,28 @@
+# Builds vGPU-NVIDIA.so from the LOCAL source tree (not the GitHub branch),
+# applying the same build-time patches the deployed prebuilt carries
+# (see docs/gke-memory-address-integration.md in llm-d-rl-time-slicing,
+# branch gcr-backend-memory-allocation): SIGRTMAX-8/-7 signal remap and
+# control-file 0777. CPU-only; compiles against CUDA headers, no GPU needed.
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS builder
+ARG SHM_SIZE_GB=25
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential && rm -rf /var/lib/apt/lists/*
+
+COPY . /tmp/GPU-CR
+# control-file 0777 is source truth since GEP-0006 (share_mem.cpp); only the
+# signal remap remains a build-time patch.
+RUN cd /tmp/GPU-CR && \
+    sed -i 's/#define CR_CKPT_SIGNAL     SIGUSR1/#define CR_CKPT_SIGNAL     (SIGRTMAX - 8)/' src/common.h && \
+    sed -i 's/#define CR_RESTORE_SIGNAL  SIGUSR2/#define CR_RESTORE_SIGNAL  (SIGRTMAX - 7)/' src/common.h && \
+    grep -q "SIGRTMAX - 8" src/common.h && \
+    grep -q "0777" src/comm/share_mem.cpp && \
+    mkdir build && cd build && \
+    cmake -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB=${SHM_SIZE_GB} .. && \
+    make -j$(nproc) && \
+    ./config_selftest
+
+FROM busybox:stable
+COPY --from=builder /tmp/GPU-CR/build/vGPU-NVIDIA.so /vGPU-NVIDIA.so
+# The coordinator ships too since GEP-0001/0006: cr_client and vGPU.so are
+# version-locked through the v2/v3 protocol, so consumers (snapshot-agent
+# image) should copy BOTH from the same build.
+COPY --from=builder /tmp/GPU-CR/build/cr_client /cr_client

@@ -15,6 +15,7 @@ std::map<void*, int> allocated_memory_type;  // 0=cudaMalloc, 1=VMM
 
 // Global handle map for all VMM allocations (both from hook and nv::allocate)
 static std::map<void*, CUmemGenericAllocationHandle> global_handle_map;
+CUcontext g_pytorch_context = nullptr;
 
 // P2P peer access hooks and helpers live in src/ipc_hooks.cpp (canonical).
 
@@ -150,6 +151,7 @@ int nv::registerHostMemory(void* ptr, size_t size) {
     if (err != cudaSuccess) {
         fprintf(stderr, "[NVIDIA] cudaHostRegister failed: %s\n", cudaGetErrorString(err));
         fprintf(stderr, "[NVIDIA] This is expected for hugepage-backed memory, continuing without pinned memory\n");
+        cudaGetLastError(); // Clear the error so it doesn't pollute the runtime state
         return -1;  // Return error but don't exit - non-pinned memory will still work
     }
     return 0;
@@ -207,6 +209,30 @@ int nv::remapPhysicalMemory(void* ptr, size_t size) {
         return -1;
     }
     
+    // If it is already mapped, release the old physical memory first
+    auto handle_it = global_handle_map.find(ptr);
+    if (handle_it != global_handle_map.end()) {
+        fprintf(stderr, "[NVIDIA] Pointer %p is already mapped, releasing old physical memory first...\n", ptr);
+        size_t old_size = it->second;
+        size_t old_aligned_size = ROUND_UP_2MB(old_size);
+        CUdeviceptr cuptr = (CUdeviceptr)ptr;
+        CUresult res = cuMemUnmap(cuptr, old_aligned_size);
+        if (res != CUDA_SUCCESS) {
+            const char* errorStr;
+            cuGetErrorString(res, &errorStr);
+            fprintf(stderr, "[NVIDIA] cuMemUnmap failed during remap: %s\n", errorStr);
+            return -1;
+        }
+        res = cuMemRelease(handle_it->second);
+        if (res != CUDA_SUCCESS) {
+            const char* errorStr;
+            cuGetErrorString(res, &errorStr);
+            fprintf(stderr, "[NVIDIA] cuMemRelease failed during remap: %s\n", errorStr);
+            return -1;
+        }
+        global_handle_map.erase(handle_it);
+    }
+
     // All allocations now use VMM, so we can remap for all
     size_t aligned_size = ROUND_UP_2MB(size);
     CUdeviceptr cuptr = (CUdeviceptr)ptr;
@@ -263,11 +289,60 @@ int nv::externalRestore(int pid) {
     return externalCheckpoint(pid);
 }
 
+int nv::pushContext() {
+    ensureCudaInitialized();
+    CUcontext target_context = context_;
+    if (g_pytorch_context != nullptr) {
+        target_context = g_pytorch_context;
+        fprintf(stderr, "[NVIDIA] Pushing captured PyTorch context: %p\n", target_context);
+    } else {
+        fprintf(stderr, "[NVIDIA] Pushing default context: %p\n", target_context);
+    }
+    CUresult res = cuCtxPushCurrent(target_context);
+    if (res != CUDA_SUCCESS) {
+        const char* errorStr;
+        cuGetErrorString(res, &errorStr);
+        fprintf(stderr, "[NVIDIA] cuCtxPushCurrent failed: %s\n", errorStr);
+        return -1;
+    }
+    return 0;
+}
+
+int nv::popContext() {
+    CUcontext popped;
+    CUresult res = cuCtxPopCurrent(&popped);
+    if (res != CUDA_SUCCESS) {
+        const char* errorStr;
+        cuGetErrorString(res, &errorStr);
+        fprintf(stderr, "[NVIDIA] cuCtxPopCurrent failed: %s\n", errorStr);
+        return -1;
+    }
+    fprintf(stderr, "[NVIDIA] Popped context: %p\n", popped);
+    return 0;
+}
+
 // ========== hook functions implementation ==========
 
 extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
-    fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu\n", size);
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+    CUcontext curr_ctx = nullptr;
+    cuCtxGetCurrent(&curr_ctx);
+    fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu, current ctx=%p\n", size, curr_ctx);
     fflush(stderr);
+
+    if (g_pytorch_context == nullptr) {
+        if (curr_ctx != nullptr) {
+            g_pytorch_context = curr_ctx;
+            fprintf(stderr, "[HOOK] Captured PyTorch CUDA context (fallback): %p\n", g_pytorch_context);
+            fflush(stderr);
+        }
+    }
+
+    if (size == 0) {
+        fprintf(stderr, "[HOOK] cudaMalloc(0) -> returning nullptr and cudaSuccess\n");
+        *devPtr = nullptr;
+        return cudaSuccess;
+    }
 
     nv* gpu_instance = nullptr;
 
@@ -303,6 +378,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return cudaErrorInitializationError;
             }
             fprintf(stderr, "[HOOK] Using existing context, device=%d\n", device);
+            g_pytorch_context = context;
         } else {
             res = cuDeviceGet(&device, 0);
             if (res != CUDA_SUCCESS) {
@@ -319,6 +395,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return cudaErrorInitializationError;
             }
             fprintf(stderr, "[HOOK] Created new context, device=%d\n", device);
+            g_pytorch_context = context;
         }
     }
     
@@ -383,11 +460,12 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
     
     fprintf(stderr, "[HOOK] cudaMalloc(%zu) => %p (VMM, aligned to %zu)\n", size, ptr, aligned_size);
     fflush(stderr);
-    
+
     return cudaSuccess;
 }
 
 extern "C" cudaError_t cudaFree(void* ptr) {
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     fprintf(stderr, "[HOOK] cudaFree(%p)\n", ptr);
     fflush(stderr);
     

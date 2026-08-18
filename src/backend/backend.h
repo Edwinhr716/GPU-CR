@@ -27,6 +27,9 @@ public:
     void setup() override;
     void* get_tmp_buf() override;
     void* get_host_buffer();
+
+private:
+    void* map_dump_buffer(bool fatal);
 };
 
 #endif

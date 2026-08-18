@@ -134,6 +134,15 @@ target_link_libraries(multi_cr_client PRIVATE ${GPU_LIBS} dl stdc++ pthread)
 target_compile_options(multi_cr_client PRIVATE -O3 -g)
 
 # ---------------------------------------------------------------------------
+# KEP-0002 config selftest — host-only, no GPU deps; run in Dockerfile.build
+# ---------------------------------------------------------------------------
+add_executable(config_selftest
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/config_selftest.cpp
+)
+target_compile_options(config_selftest PRIVATE -O2 -g)
+
+
+# ---------------------------------------------------------------------------
 # Optional adapters (only meaningful on NVIDIA)
 # ---------------------------------------------------------------------------
 if(GPU_CR_BUILD_NCCL_ADAPTER)

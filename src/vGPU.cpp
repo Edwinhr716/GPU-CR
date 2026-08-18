@@ -7,14 +7,18 @@
 #include <mutex>
 #include <vector>
 #include <thread>
+#include <set>
 
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include "common.h"
+#include "ctl_path.h"
 #include "comm/comm.h"
 #include "backend/backend.h"
 #include "GPUs/GPU.h"
@@ -34,6 +38,7 @@ static void*  g_local_alloc_data_buf  = nullptr;
 static size_t g_local_alloc_data_size = 0;
 
 std::mutex fs_mutex;
+std::mutex gpu_mem_mutex;
 Comm *comm;
 Backend *backend;
 GPU *gpu;
@@ -41,6 +46,10 @@ GPU *gpu;
 void* staging_buf[STAGING_BUF_NUM];
 
 bool CR_initialized = false;
+
+// errno-style op status; copied into control->op_status at FINISH so v2
+// clients can distinguish clean failures from success (GEP-0001/KEP-0002).
+int g_op_status = 0;
 
 // Helper function: multi-threaded memcpy
 void memcpy_multi(void* dest, void* src, size_t size) {
@@ -59,26 +68,64 @@ void memcpy_multi(void* dest, void* src, size_t size) {
     }
 }
 
+// GEP-0005 §3: the driver rejects a cudaMemcpyAsync on a hooked VMM mapping
+// when the copy crosses a 2MB granule boundary with an unrounded length
+// (nv.cpp:133 "invalid argument" at 4B/rank-64; see
+// docs/proposals/0005-multi-handle-unrounded-dumps.md). Clamp each device
+// copy so it ends at the next granule boundary or at the region end: every
+// issued copy is <=2MB and granule-aligned at its start or its end — the
+// copy shapes validated at scale. Applies to the selective (unrounded)
+// paths only; the full-checkpoint paths copy rounded extents and never hit
+// this boundary.
+static inline size_t granule_clamp(const void* dev_ptr, size_t len) {
+    size_t to_boundary = VMM_GRANULE_SIZE - ((uintptr_t)dev_ptr & (VMM_GRANULE_SIZE - 1));
+    return len < to_boundary ? len : to_boundary;
+}
+
 
 double ckpt() {
     fprintf(stderr, "[vGPU-CKPT] ckpt() entered, PID=%d\n", getpid());
     fflush(stderr);
-    
+
     double tot_size = 0;
-    
+
     auto time_start = std::chrono::high_resolution_clock::now();
     long sync_time = 0, cpu_copy_time = 0, release_time = 0;
 
     void* tmp_buf = backend->get_tmp_buf();
     fprintf(stderr, "[vGPU-CKPT] tmp_buf=%p\n", tmp_buf);
     fflush(stderr);
+    if (!tmp_buf) {
+        fprintf(stderr, "[vGPU-CKPT] Error: dump buffer unavailable (deferred-mode materialization failed?)\n");
+        g_op_status = ENOMEM;
+        return -1;
+    }
     shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
     int current_buf = 0;
     size_t buf_offset = 0;
     size_t des_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
-    
+
     fs_mutex.lock();
-    
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+
+    // KEP-0002: with env-shrinkable buffers an oversized full checkpoint
+    // is an operator-config away, so validate BEFORE touching fs or GPU
+    // state — nothing dumped, nothing released, clean op_status failure
+    // instead of the historical mid-loop exit(-1).
+    {
+        size_t required = ROUND_UP_2MB(sizeof(shared_mem_fs));
+        for (const auto& entry : allocated_memory)
+            required += ROUND_UP_2MB(entry.second);
+        if (required > SHM_SIZE) {
+            fprintf(stderr, "[vGPU-CKPT] Error: checkpoint needs %zu MiB but the dump buffer is "
+                            "%zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
+                    required >> 20, (size_t)SHM_SIZE >> 20);
+            g_op_status = ENOSPC;
+            fs_mutex.unlock();
+            return -1;
+        }
+    }
+
     fs->file_num = 0;
     fs->current_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
 
@@ -219,12 +266,416 @@ double ckpt() {
     return tot_size;
 }
 
-double restore_ptr_and_content() {
+bool find_containing_allocation(void* ptr, void** base_ptr, size_t* alloc_size) {
+    for (auto const& [alloc_ptr, size] : allocated_memory) {
+        if (ptr >= alloc_ptr && (char*)ptr < (char*)alloc_ptr + size) {
+            *base_ptr = alloc_ptr;
+            *alloc_size = size;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// GEP-0001: destination-path selective checkpoints.
+// A caller-chosen file replaces the per-PID staging buffer for one op.
+// The caller pre-creates the file (O_CREAT only); sizing is done HERE,
+// because only the .so knows the containing-allocation totals. All
+// dest-path failures set g_op_status and return instead of exit(-1) —
+// the workload must survive a bad path or a full store.
+// ---------------------------------------------------------------------------
+#define HUGETLBFS_FS_MAGIC 0x958458f6
+
+static uint64_t g_dump_generation = 0;
+
+struct DestMap {
+    void*  addr = nullptr;
+    size_t map_size = 0; // bytes mapped
+    size_t capacity = 0; // header + extents + commit marker
+    int    fd = -1;
+    bool   hugetlb = false;
+};
+
+static void dest_close(DestMap* dm) {
+    if (dm->addr && dm->addr != MAP_FAILED) munmap(dm->addr, dm->map_size);
+    if (dm->fd >= 0) close(dm->fd);
+    dm->addr = nullptr;
+    dm->fd = -1;
+}
+
+static bool dest_open_common(const char* path, int prot, DestMap* dm) {
+    // Never O_CREAT: existence is the caller's responsibility, and creating
+    // here would let a stale dest_path materialize files (GEP-0001 F2).
+    dm->fd = open(path, (prot & PROT_WRITE) ? O_RDWR : O_RDONLY);
+    if (dm->fd < 0) {
+        g_op_status = errno;
+        fprintf(stderr, "[vGPU-DEST] open(%s) failed: %s\n", path, strerror(errno));
+        return false;
+    }
+    struct statfs sfs;
+    if (fstatfs(dm->fd, &sfs) == 0 && (unsigned long)sfs.f_type == HUGETLBFS_FS_MAGIC)
+        dm->hugetlb = true;
+    return true;
+}
+
+static bool dest_open_for_ckpt(const char* path, size_t total, DestMap* dm) {
+    if (!dest_open_common(path, PROT_READ | PROT_WRITE, dm)) return false;
+    // tmpfs/disk reserve nothing at ftruncate or mmap: without fallocate a
+    // full filesystem is a SIGBUS mid-store, not an error. hugetlbfs
+    // reserves at mmap, so ENOMEM already surfaces there.
+    if (!dm->hugetlb) {
+        int rc = posix_fallocate(dm->fd, 0, (off_t)total);
+        if (rc != 0) {
+            g_op_status = rc;
+            fprintf(stderr, "[vGPU-DEST] fallocate(%s, %zu) failed: %s\n", path, total, strerror(rc));
+            dest_close(dm);
+            return false;
+        }
+    }
+    size_t fsize = dm->hugetlb ? ROUND_UP_2MB(total) : total;
+    if (ftruncate(dm->fd, (off_t)fsize) < 0) {
+        g_op_status = errno;
+        fprintf(stderr, "[vGPU-DEST] ftruncate(%s, %zu) failed: %s\n", path, fsize, strerror(errno));
+        dest_close(dm);
+        return false;
+    }
+    dm->addr = mmap(NULL, fsize, PROT_READ | PROT_WRITE, MAP_SHARED, dm->fd, 0);
+    if (dm->addr == MAP_FAILED) {
+        g_op_status = errno;
+        fprintf(stderr, "[vGPU-DEST] mmap(%s, %zu) failed: %s\n", path, fsize, strerror(errno));
+        dest_close(dm);
+        return false;
+    }
+    dm->map_size = fsize;
+    dm->capacity = total;
+    return true;
+}
+
+// Restore side: refuse anything without a valid header and commit marker —
+// a torn dump must fail the op, not feed garbage to the GPU (GEP-0001 F7).
+static bool dest_open_for_restore(const char* path, DestMap* dm) {
+    if (!dest_open_common(path, PROT_READ, dm)) return false;
+    struct stat st;
+    if (fstat(dm->fd, &st) < 0) {
+        g_op_status = errno;
+        dest_close(dm);
+        return false;
+    }
+    size_t min_size = ROUND_UP_2MB(sizeof(shared_mem_fs)) + sizeof(dump_commit);
+    if ((size_t)st.st_size < min_size) {
+        g_op_status = EINVAL;
+        fprintf(stderr, "[vGPU-DEST] %s too small (%lld bytes) to hold a dump\n", path, (long long)st.st_size);
+        dest_close(dm);
+        return false;
+    }
+    dm->addr = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, dm->fd, 0);
+    if (dm->addr == MAP_FAILED) {
+        g_op_status = errno;
+        fprintf(stderr, "[vGPU-DEST] mmap(%s) failed: %s\n", path, strerror(errno));
+        dest_close(dm);
+        return false;
+    }
+    dm->map_size = st.st_size;
+    dm->capacity = st.st_size;
+
+    shared_mem_fs* fs = (shared_mem_fs*)dm->addr;
+    uint64_t hdr = ROUND_UP_2MB(sizeof(shared_mem_fs));
+    if (fs->file_num == 0 || fs->file_num >= MAX_FILE_NUM ||
+        fs->current_offset < hdr ||
+        fs->current_offset + sizeof(dump_commit) > dm->map_size) {
+        g_op_status = EINVAL;
+        fprintf(stderr, "[vGPU-DEST] %s has implausible header (file_num=%llu current_offset=%llu)\n",
+                path, (unsigned long long)fs->file_num, (unsigned long long)fs->current_offset);
+        dest_close(dm);
+        return false;
+    }
+    const dump_commit* dc = (const dump_commit*)((const char*)dm->addr + fs->current_offset);
+    if (dc->magic != DUMP_COMMIT_MAGIC) {
+        g_op_status = EINVAL;
+        fprintf(stderr, "[vGPU-DEST] %s has no commit marker: torn or foreign dump, refusing restore\n", path);
+        dest_close(dm);
+        return false;
+    }
+    return true;
+}
+
+double ckpt_selective(const selective_cr_request* req) {
+    const char* dest_path = (req->proto_version >= SELECTIVE_CR_PROTO_V2 && req->dest_path[0] != '\0')
+                                ? req->dest_path : nullptr;
+    fprintf(stderr, "[vGPU-SELECTIVE-CKPT] ckpt_selective() entered, %u regions, PID=%d, dest=%s\n",
+            req->num_regions, getpid(), dest_path ? dest_path : "(per-PID buffer)");
+    fflush(stderr);
+
     double tot_size = 0;
-    
+
+    auto time_start = std::chrono::high_resolution_clock::now();
+    long sync_time = 0, cpu_copy_time = 0, release_time = 0;
+
+    int current_buf = 0;
+    size_t buf_offset = 0;
+    size_t des_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
+
+    fs_mutex.lock();
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+
+    // Resolve target blocks BEFORE picking the output: with a destination
+    // file the exact dump size must be known up front (only the .so knows
+    // the containing-allocation totals — GEP-0001 preloader-authoritative
+    // sizing). Both mutexes are held, so the sizes cannot shift under us.
+    std::set<void*> blocks_to_snapshot;
+    for (uint32_t ri = 0; ri < req->num_regions; ri++) {
+        void* d = req->regions[ri].ptr;
+        void* base_ptr = nullptr;
+        size_t alloc_size = 0;
+        if (find_containing_allocation(d, &base_ptr, &alloc_size)) {
+            blocks_to_snapshot.insert(base_ptr);
+        } else {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] WARNING: ptr %p not in any allocated memory block, skipping\n", d);
+        }
+    }
+
+    size_t dump_total = ROUND_UP_2MB(sizeof(shared_mem_fs));
+    for (void* base_ptr : blocks_to_snapshot)
+        dump_total += allocated_memory.find(base_ptr)->second;
+
+    DestMap dm;
+    shared_mem_fs* fs;
+    size_t fs_capacity; // extent bound: header + extents, excluding the marker
+    if (dest_path) {
+        if (!dest_open_for_ckpt(dest_path, dump_total + sizeof(dump_commit), &dm)) {
+            fs_mutex.unlock();
+            return -1;
+        }
+        fs = (shared_mem_fs*)dm.addr;
+        fs_capacity = dump_total;
+    } else {
+        fs = (shared_mem_fs*)backend->get_tmp_buf();
+        if (!fs) {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: dump buffer unavailable (deferred-mode "
+                            "materialization failed?)\n");
+            g_op_status = ENOMEM;
+            fs_mutex.unlock();
+            return -1;
+        }
+        fs_capacity = SHM_SIZE;
+        // KEP-0002: the legacy buffer is env-shrinkable now — same clean
+        // pre-op failure as the dest path instead of the historical
+        // mid-loop exit(-1).
+        if (dump_total > fs_capacity) {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: selective checkpoint needs %zu MiB but the "
+                            "dump buffer is %zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
+                    dump_total >> 20, fs_capacity >> 20);
+            g_op_status = ENOSPC;
+            fs_mutex.unlock();
+            return -1;
+        }
+    }
+
+    fs->file_num = 0;
+    fs->current_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
+
+    GPUStream stream;
+    GPUEvent event;
+    if (gpu->createStream(&stream) != 0) {
+        fprintf(stderr, "Error: Failed to create stream\n");
+        if (dest_path) {
+            g_op_status = EIO;
+            dest_close(&dm);
+            fs_mutex.unlock();
+            return -1;
+        }
+        fs_mutex.unlock();
+        exit(-1);
+    }
+    if (gpu->createEvent(&event) != 0) {
+        fprintf(stderr, "Error: Failed to create event\n");
+        gpu->destroyStream(stream);
+        if (dest_path) {
+            g_op_status = EIO;
+            dest_close(&dm);
+            fs_mutex.unlock();
+            return -1;
+        }
+        fs_mutex.unlock();
+        exit(-1);
+    }
+    gpu->recordEvent(event, stream);
+
+    for (void* base_ptr : blocks_to_snapshot) {
+        auto it = allocated_memory.find(base_ptr);
+        assert(it != allocated_memory.end());
+        size_t alloc_size = it->second;
+        // Dump only the caller-requested allocation size, not the 2MB-rounded
+        // VMM block: the rounding padding was never handed to the application,
+        // and release/remap re-round internally (releasePhysicalMemory,
+        // remapPhysicalMemory), so physical block handling is unchanged.
+        uint64_t size = alloc_size;
+        tot_size += size;
+
+        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Saving VMM block: base_ptr=%p size=%lu (aligned=%lu)\n",
+                base_ptr, alloc_size, size);
+
+        fs->files[fs->file_num].ptr = base_ptr;
+        fs->files[fs->file_num].start_offset = fs->current_offset;
+        fs->files[fs->file_num].size = size;
+        fs->current_offset += size;
+        // Bound against the actual output: destination files are sized
+        // exactly (this cannot trip there — defensive only); the per-PID
+        // buffer keeps its historical SHM_SIZE check.
+        if (fs->current_offset > fs_capacity) {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: Not enough space in %s\n",
+                    dest_path ? dest_path : "shared memory");
+            gpu->destroyStream(stream);
+            gpu->destroyEvent(event);
+            if (dest_path) {
+                g_op_status = ENOSPC;
+                dest_close(&dm);
+                fs_mutex.unlock();
+                return -1;
+            }
+            fs_mutex.unlock();
+            exit(-1);
+        }
+        fs->file_num++;
+        if (fs->file_num >= MAX_FILE_NUM) {
+            fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: Too many files in shared memory fs\n");
+            gpu->destroyStream(stream);
+            gpu->destroyEvent(event);
+            if (dest_path) {
+                g_op_status = E2BIG;
+                dest_close(&dm);
+                fs_mutex.unlock();
+                return -1;
+            }
+            fs_mutex.unlock();
+            exit(-1);
+        }
+
+        void* d = base_ptr;
+        while (size > 0) {
+            size_t cur_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
+            cur_size = granule_clamp(d, cur_size);  // GEP-0005 §3
+            void* start_addr = (char*)staging_buf[current_buf & 1] + buf_offset;
+
+            if (gpu->memcpyAsync(start_addr, d, cur_size, GPUMemcpyKind::DeviceToHost, stream) != 0) {
+                fprintf(stderr, "Error: memcpyAsync failed\n");
+                fs_mutex.unlock();
+                exit(-1);
+            }
+
+            buf_offset += cur_size;
+            d = (char*)d + cur_size;
+            size -= cur_size;
+            if (buf_offset >= STAGING_BUF_SIZE) {
+                assert(buf_offset == STAGING_BUF_SIZE);
+                if (current_buf > 0) {
+                    auto t3 = std::chrono::high_resolution_clock::now();
+                    gpu->synchronizeEvent(event);
+                    auto t4 = std::chrono::high_resolution_clock::now();
+                    sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
+
+                    auto t5 = std::chrono::high_resolution_clock::now();
+                    memcpy_multi((char*)fs + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
+                    auto t6 = std::chrono::high_resolution_clock::now();
+                    cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
+
+                    des_offset += STAGING_BUF_SIZE;
+                }
+                buf_offset = 0;
+                current_buf++;
+                gpu->recordEvent(event, stream);
+            }
+        }
+    }
+
+    if (current_buf > 0) {
+        auto t3 = std::chrono::high_resolution_clock::now();
+        gpu->synchronizeEvent(event);
+        auto t4 = std::chrono::high_resolution_clock::now();
+        sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
+
+        auto t5 = std::chrono::high_resolution_clock::now();
+        memcpy_multi((char*)fs + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
+        auto t6 = std::chrono::high_resolution_clock::now();
+        cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
+
+        des_offset += STAGING_BUF_SIZE;
+    }
+
+    auto t7 = std::chrono::high_resolution_clock::now();
+    gpu->synchronizeStream(stream);
+    auto t8 = std::chrono::high_resolution_clock::now();
+    sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
+
+    auto t9 = std::chrono::high_resolution_clock::now();
+    memcpy_multi((char*)fs + des_offset, staging_buf[current_buf & 1], buf_offset);
+    auto t10 = std::chrono::high_resolution_clock::now();
+    cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t10 - t9).count();
+
+    assert(des_offset + buf_offset == fs->current_offset);
+    gpu->destroyStream(stream);
+    gpu->destroyEvent(event);
+
+    // Commit marker AFTER the last extent landed: restores refuse dumps
+    // without it, so a crash anywhere above leaves a detectably-torn file.
+    // The magic is stored last so a marker is never observed half-written.
+    if (fs->current_offset + sizeof(dump_commit) <= (dest_path ? dm.capacity : (size_t)SHM_SIZE)) {
+        dump_commit* dc = (dump_commit*)((char*)fs + fs->current_offset);
+        dc->generation = ++g_dump_generation;
+        dc->magic = DUMP_COMMIT_MAGIC;
+    }
+
+    fprintf(stderr, "Releasing physical GPU memory for %lu selective regions...\n", (unsigned long)fs->file_num);
+    auto t11 = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < fs->file_num; i++) {
+        void* ptr = fs->files[i].ptr;
+        if (gpu->releasePhysicalMemory(ptr) != 0) {
+            fprintf(stderr, "Error: Failed to release physical memory for ptr %p\n", ptr);
+            if (dest_path) {
+                g_op_status = EIO;
+                dest_close(&dm);
+                fs_mutex.unlock();
+                return -1;
+            }
+            fs_mutex.unlock();
+            exit(-1);
+        }
+    }
+    auto t12 = std::chrono::high_resolution_clock::now();
+    release_time = std::chrono::duration_cast<std::chrono::microseconds>(t12 - t11).count();
+    fprintf(stderr, "Physical GPU memory released for selective regions, virtual addresses preserved\n");
+
+    fprintf(stderr, "=== Selective Checkpoint Timing Breakdown ===\n");
+    fprintf(stderr, "  Regions:          %6lu\n", (unsigned long)fs->file_num);
+    fprintf(stderr, "  GPU sync:         %6ld ms\n", sync_time / 1000);
+    fprintf(stderr, "  CPU memcpy:       %6ld ms (%.2f GB/s)\n",
+            cpu_copy_time / 1000,
+            tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (cpu_copy_time / 1000000.0) : 0.0);
+    fprintf(stderr, "  Release memory:   %6ld ms\n", release_time / 1000);
+    long data_transfer_time = sync_time + cpu_copy_time;
+    fprintf(stderr, "  Data transfer:    %6ld ms (%.2f GB/s)\n",
+            data_transfer_time / 1000,
+            tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (data_transfer_time / 1000000.0) : 0.0);
+    fprintf(stderr, "===============================================\n");
+
+    if (dest_path) dest_close(&dm);
+    fs_mutex.unlock();
+    return tot_size;
+}
+
+double restore_ptr_and_content() {
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+    double tot_size = 0;
+
     long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
-    
+
     void* tmp_buf = backend->get_tmp_buf();
+    if (!tmp_buf) {
+        fprintf(stderr, "[vGPU-restore] Error: dump buffer unavailable (deferred-mode materialization failed?)\n");
+        g_op_status = ENOMEM;
+        return -1;
+    }
     shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
 
     uint64_t file_num = fs->file_num;
@@ -337,22 +788,217 @@ double restore_ptr_and_content() {
     return tot_size;
 }
 
+double restore_ptr_and_content_selective(const selective_cr_request* req) {
+    const char* dest_path = (req->proto_version >= SELECTIVE_CR_PROTO_V2 && req->dest_path[0] != '\0')
+                                ? req->dest_path : nullptr;
+    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+    double tot_size = 0;
+
+    long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
+
+    DestMap dm;
+    shared_mem_fs* fs;
+    if (dest_path) {
+        if (!dest_open_for_restore(dest_path, &dm)) return -1;
+        fs = (shared_mem_fs*)dm.addr;
+        // Cross-check the request against the dump (GEP-0001 F7): every
+        // requested region must resolve to a live allocation whose base is
+        // one of the dump's files — the header is otherwise trusted input
+        // from a caller-writable directory.
+        for (uint32_t ri = 0; ri < req->num_regions; ri++) {
+            void* base_ptr = nullptr;
+            size_t alloc_size = 0;
+            if (!find_containing_allocation(req->regions[ri].ptr, &base_ptr, &alloc_size)) {
+                fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] region ptr %p not in any live allocation\n",
+                        req->regions[ri].ptr);
+                g_op_status = EINVAL;
+                dest_close(&dm);
+                return -1;
+            }
+            bool in_dump = false;
+            for (uint64_t i = 0; i < fs->file_num && !in_dump; i++)
+                in_dump = (fs->files[i].ptr == base_ptr);
+            if (!in_dump) {
+                fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] region ptr %p (block %p) absent from dump %s\n",
+                        req->regions[ri].ptr, base_ptr, dest_path);
+                g_op_status = EINVAL;
+                dest_close(&dm);
+                return -1;
+            }
+        }
+    } else {
+        fs = (shared_mem_fs*)backend->get_tmp_buf();
+        if (!fs) {
+            fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: dump buffer unavailable (deferred-mode "
+                            "materialization failed?)\n");
+            g_op_status = ENOMEM;
+            return -1;
+        }
+    }
+
+    uint64_t file_num = fs->file_num;
+    fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] restore %lu selective regions from %s\n",
+            file_num, dest_path ? dest_path : "(per-PID buffer)");
+
+    fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Remapping physical GPU memory...\n");
+    auto t1 = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < file_num; i++) {
+        void* ptr = fs->files[i].ptr;
+        uint64_t size = fs->files[i].size;
+        if (gpu->remapPhysicalMemory(ptr, size) != 0) {
+            fprintf(stderr, "Error: Failed to remap physical memory for ptr %p\n", ptr);
+            if (dest_path) {
+                g_op_status = EIO;
+                dest_close(&dm);
+                return -1;
+            }
+            exit(-1);
+        }
+    }
+    auto t2 = std::chrono::high_resolution_clock::now();
+    remap_time = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+    fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Physical GPU memory remapped\n");
+
+    GPUStream stream;
+    GPUEvent event;
+    if (gpu->createStream(&stream) != 0) {
+        fprintf(stderr, "Error: Failed to create stream\n");
+        if (dest_path) {
+            g_op_status = EIO;
+            dest_close(&dm);
+            return -1;
+        }
+        exit(-1);
+    }
+    if (gpu->createEvent(&event) != 0) {
+        fprintf(stderr, "Error: Failed to create event\n");
+        gpu->destroyStream(stream);
+        if (dest_path) {
+            g_op_status = EIO;
+            dest_close(&dm);
+            return -1;
+        }
+        exit(-1);
+    }
+    gpu->recordEvent(event, stream);
+
+    int current_buf = 0;
+    size_t buf_offset = 0;
+    size_t src_offset = 0;
+
+    for (uint64_t i = 0; i < file_num; i++) {
+        void* requestedAddr = fs->files[i].ptr;
+        uint64_t offset = fs->files[i].start_offset;
+        uint64_t size = fs->files[i].size;
+        tot_size += size;
+
+        if (i == 0) {
+            src_offset = fs->files[i].start_offset;
+            size_t cpu_copy_size = std::min((size_t)(fs->current_offset - src_offset), (size_t)STAGING_BUF_SIZE);
+            auto tc1 = std::chrono::high_resolution_clock::now();
+            memcpy_multi(staging_buf[current_buf & 1], (char*)fs + src_offset, cpu_copy_size);
+            auto tc2 = std::chrono::high_resolution_clock::now();
+            cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(tc2 - tc1).count();
+            buf_offset = 0;
+        }
+
+        while (size > 0) {
+            size_t this_copy_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
+            this_copy_size = granule_clamp(requestedAddr, this_copy_size);  // GEP-0005 §3
+            assert(buf_offset == offset - src_offset);
+
+            if (gpu->memcpyAsync(requestedAddr, (char*)staging_buf[current_buf & 1] + (offset - src_offset),
+                               this_copy_size, GPUMemcpyKind::HostToDevice, stream) != 0) {
+                fprintf(stderr, "Error: memcpyAsync failed\n");
+                if (dest_path) {
+                    gpu->destroyStream(stream);
+                    gpu->destroyEvent(event);
+                    g_op_status = EIO;
+                    dest_close(&dm);
+                    return -1;
+                }
+                exit(-1);
+            }
+
+            buf_offset += this_copy_size;
+            offset += this_copy_size;
+            requestedAddr = (char*)requestedAddr + this_copy_size;
+            size -= this_copy_size;
+
+            if (buf_offset >= STAGING_BUF_SIZE) {
+                assert(buf_offset == STAGING_BUF_SIZE);
+                src_offset += STAGING_BUF_SIZE;
+                size_t cpu_copy_size = std::min((size_t)(fs->current_offset - src_offset), (size_t)STAGING_BUF_SIZE);
+
+                auto ts1 = std::chrono::high_resolution_clock::now();
+                gpu->synchronizeEvent(event);
+                auto ts2 = std::chrono::high_resolution_clock::now();
+                sync_time += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
+
+                auto tc3 = std::chrono::high_resolution_clock::now();
+                memcpy_multi(staging_buf[(current_buf + 1) & 1], (char*)fs + src_offset, cpu_copy_size);
+                auto tc4 = std::chrono::high_resolution_clock::now();
+                cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(tc4 - tc3).count();
+
+                buf_offset = 0;
+                current_buf++;
+                gpu->recordEvent(event, stream);
+            }
+        }
+    }
+
+    auto ts3 = std::chrono::high_resolution_clock::now();
+    gpu->synchronizeStream(stream);
+    auto ts4 = std::chrono::high_resolution_clock::now();
+    sync_time += std::chrono::duration_cast<std::chrono::microseconds>(ts4 - ts3).count();
+
+    gpu->destroyStream(stream);
+    gpu->destroyEvent(event);
+
+    fprintf(stderr, "=== Selective Restore Timing Breakdown ===\n");
+    fprintf(stderr, "  Regions:          %6lu\n", file_num);
+    fprintf(stderr, "  Remap memory:     %6ld ms\n", remap_time / 1000);
+    fprintf(stderr, "  CPU memcpy:       %6ld ms (%.2f GB/s)\n",
+            cpu_copy_time / 1000,
+            tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (cpu_copy_time / 1000000.0) : 0.0);
+    fprintf(stderr, "  GPU sync:         %6ld ms\n", sync_time / 1000);
+    long data_transfer_time = cpu_copy_time + sync_time;
+    fprintf(stderr, "  Data transfer:    %6ld ms (%.2f GB/s)\n",
+            data_transfer_time / 1000,
+            tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (data_transfer_time / 1000000.0) : 0.0);
+    fprintf(stderr, "============================================\n");
+
+    if (dest_path) dest_close(&dm);
+    return tot_size;
+}
+
 int get_id() {
     char id_name[512];
-    const char* ctl_dir = std::getenv("EXPORT_FILE_PATH");
-    if (!ctl_dir) ctl_dir = "/mnt/huge-ckpt";
+    int ctl_mode = 0;
+    const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
     snprintf(id_name, sizeof(id_name), "%s/control", ctl_dir);
     int fd_id = open(id_name, O_CREAT | O_RDWR, 0755);
     if (fd_id < 0) {
         perror("open()");
         exit(EXIT_FAILURE);
     }
+    // The counter is a single atomic int: on the ctl tmpfs one 4KiB page
+    // suffices (and frees the hugepage the legacy layout pinned); on
+    // hugetlbfs the historical 2MiB sizing is kept.
+    size_t id_size = ctl_mode ? 4096 : HUGE_PAGE_SIZE;
     // Set file size before mmap to avoid Bus error
-    if (ftruncate(fd_id, HUGE_PAGE_SIZE) < 0) {
+    if (ftruncate(fd_id, id_size) < 0) {
         perror("ftruncate()");
         exit(EXIT_FAILURE);
     }
-    std::atomic<int>* id_ptr = (std::atomic<int>*)mmap(NULL, HUGE_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_id, 0);
+    if (ctl_mode) {
+        int rc = posix_fallocate(fd_id, 0, (off_t)id_size);
+        if (rc != 0) {
+            fprintf(stderr, "posix_fallocate(%s): %s (ctl tmpfs full?)\n", id_name, strerror(rc));
+            exit(EXIT_FAILURE);
+        }
+    }
+    std::atomic<int>* id_ptr = (std::atomic<int>*)mmap(NULL, id_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_id, 0);
     if (id_ptr == MAP_FAILED) {
         perror("mmap()");
         exit(EXIT_FAILURE);
@@ -371,8 +1017,35 @@ void init_CR() {
 
     fprintf(stderr, "[init_CR] Starting CR initialization...\n");
     int id = get_id();
+
+    // Write PID -> ID mapping file. write(2), not stdio: buffered stdio
+    // silently produces an EMPTY file on hugetlbfs (the historical pid_map
+    // bug); on the ctl tmpfs plain writes just work.
+    int ctl_mode = 0;
+    const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
+    char map_name[512];
+    snprintf(map_name, sizeof(map_name), "%s/pid_map_%d", ctl_dir, getpid());
+    int fd_map = open(map_name, O_CREAT | O_TRUNC | O_WRONLY, 0666);
+    if (fd_map >= 0) {
+        char id_buf[32];
+        int id_len = snprintf(id_buf, sizeof(id_buf), "%d\n", id);
+        ssize_t written = write(fd_map, id_buf, id_len);
+        close(fd_map);
+        chmod(map_name, 0666);
+        if (written == id_len)
+            fprintf(stderr, "[init_CR] Written PID map: %s -> %d\n", map_name, id);
+        else
+            fprintf(stderr, "[init_CR] PID map write to %s failed (%s) — callers fall back to /proc/<pid>/maps\n",
+                    map_name, strerror(errno));
+    } else {
+        perror("[init_CR] Failed to open PID map file for writing");
+    }
+
     comm = new ShareMemComm(getpid());
     comm->setup();
+    // Publish dest-path capability (GEP-0001). Persistent across ops: the
+    // consume-once zeroing at FINISH deliberately leaves this word alone.
+    ((ShareMemComm*)comm)->control->capability |= CR_CAP_DEST_PATH;
     backend = new ShareMem(id);
     backend->setup();
     gpu = createGPU();  // createGPU() will detect the GPU vendor and return the appropriate GPU object
@@ -400,6 +1073,20 @@ void init_CR() {
 
     CR_initialized = true;
     fprintf(stderr, "[init_CR] Initialization complete, setting CR_initialized = true\n");
+}
+
+// Post-op bookkeeping (GEP-0001, extended to full ops by KEP-0002): report
+// status + proto ack, then consume the v2 request extension so a stale
+// dest_path can never redirect a later op (a v1 cr_client only rewrites
+// the v1 prefix). v2 clients gate cuda-checkpoint --toggle on op_status —
+// never freeze a process whose state was not saved.
+static void finish_op(ShareMemComm* scomm) {
+    signal_controls* c = scomm->control;
+    c->op_status = g_op_status;
+    c->proto_ack = SELECTIVE_CR_PROTO_V2;
+    c->selective_req.proto_version = 0;
+    memset(c->selective_req.dest_path, 0, SELECTIVE_CR_MAX_PATH);
+    c->capability |= CR_CAP_DEST_PATH;
 }
 
 void cr_signal_handler(int signum) {
@@ -432,7 +1119,43 @@ void cr_signal_handler(int signum) {
     }
 
     uint32_t msg = comm->recv_msg();
-    if(msg == CKPT_MSG) {
+    gpu->pushContext();
+    if(msg == SELECTIVE_CKPT_MSG) {
+        ShareMemComm* scomm = (ShareMemComm*)comm;
+        const selective_cr_request* req = &scomm->control->selective_req;
+        g_op_status = 0;
+        fprintf(stderr, "waiting for kernels to finish...\n");
+        gpu->syncAllKernels();
+        fprintf(stderr, "start selective ckpt (%u regions)...\n", req->num_regions);
+        auto start = std::chrono::high_resolution_clock::now();
+        double tot_size = ckpt_selective(req);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        if (tot_size < 0)
+            fprintf(stderr, "selective ckpt FAILED, status=%d (%s)\n", g_op_status, strerror(g_op_status));
+        else
+            fprintf(stderr, "selective ckpt size: %f GB, time: %ld ms, bw: %f GB/s\n",
+                   tot_size / 1024 / 1024 / 1024, duration.count(),
+                   duration.count() > 0 ? tot_size / duration.count() * 1000 / 1024 / 1024 / 1024 : 0.0);
+        finish_op(scomm);
+    } else if(msg == SELECTIVE_RESTORE_MSG) {
+        ShareMemComm* scomm = (ShareMemComm*)comm;
+        const selective_cr_request* req = &scomm->control->selective_req;
+        g_op_status = 0;
+        fprintf(stderr, "start selective restore...\n");
+        auto start = std::chrono::high_resolution_clock::now();
+        double tot_size = restore_ptr_and_content_selective(req);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        if (tot_size < 0)
+            fprintf(stderr, "selective restore FAILED, status=%d (%s)\n", g_op_status, strerror(g_op_status));
+        else
+            fprintf(stderr, "selective restore size: %f GB, time: %ld ms, bw: %f GB/s\n",
+                   tot_size / 1024 / 1024 / 1024, duration.count(),
+                   duration.count() > 0 ? tot_size / duration.count() * 1000 / 1024 / 1024 / 1024 : 0.0);
+        finish_op(scomm);
+    } else if(msg == CKPT_MSG) {
+        g_op_status = 0;
         fprintf(stderr, "waiting for kernels to finish...\n");
         gpu->syncAllKernels();
         fprintf(stderr, "start ckpt...\n");
@@ -440,37 +1163,52 @@ void cr_signal_handler(int signum) {
         double tot_size = ckpt();
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        fprintf(stderr, "ckpt size: %f GB, time: %ld ms, bw: %f GB/s\n",
-               tot_size / 1024 / 1024 / 1024, duration.count(),
-               tot_size / duration.count() * 1000 / 1024 / 1024 / 1024);
+        if (tot_size < 0) {
+            // KEP-0002 clean failure: nothing dumped, nothing released —
+            // the workload keeps running. P2P must NOT be disabled and a
+            // v2 cr_client must NOT proceed to cuda-checkpoint --toggle.
+            fprintf(stderr, "ckpt FAILED, status=%d (%s)\n", g_op_status, strerror(g_op_status));
+        } else {
+            fprintf(stderr, "ckpt size: %f GB, time: %ld ms, bw: %f GB/s\n",
+                   tot_size / 1024 / 1024 / 1024, duration.count(),
+                   tot_size / duration.count() * 1000 / 1024 / 1024 / 1024);
 
-        // Disable P2P peer access before cuda-checkpoint freeze.
-        // P2P access creates driver-level state that cuda-checkpoint cannot restore.
-        // This must happen AFTER ckpt() (data is saved) and BEFORE cuda-checkpoint runs.
+            // Disable P2P peer access before cuda-checkpoint freeze.
+            // P2P access creates driver-level state that cuda-checkpoint cannot restore.
+            // This must happen AFTER ckpt() (data is saved) and BEFORE cuda-checkpoint runs.
 #if !defined(__HIP_PLATFORM_AMD__)
-        fprintf(stderr, "[vGPU] Disabling P2P peer access for cuda-checkpoint...\n");
-        ipc_disable_all_peer_access();
+            fprintf(stderr, "[vGPU] Disabling P2P peer access for cuda-checkpoint...\n");
+            ipc_disable_all_peer_access();
 #endif
-        // Note: External checkpoint (cuda-checkpoint for NVIDIA, CRIU for AMD)
-        // is called from cr_client, not here
+            // Note: External checkpoint (cuda-checkpoint for NVIDIA, CRIU for AMD)
+            // is called from cr_client, not here
+        }
+        finish_op((ShareMemComm*)comm);
     } else if (msg == RESTORE_MSG) {
+        g_op_status = 0;
         // Note: cuda-checkpoint restore was already called by cr_client before this signal
         fprintf(stderr, "start restore...\n");
         auto start = std::chrono::high_resolution_clock::now();
         double tot_size = restore_ptr_and_content();
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        fprintf(stderr, "restore size: %f GB, time: %ld ms, bw: %f GB/s\n",
-               tot_size / 1024 / 1024 / 1024, duration.count(),
-               tot_size / duration.count() * 1000 / 1024 / 1024 / 1024);
+        if (tot_size < 0) {
+            fprintf(stderr, "restore FAILED, status=%d (%s)\n", g_op_status, strerror(g_op_status));
+        } else {
+            fprintf(stderr, "restore size: %f GB, time: %ld ms, bw: %f GB/s\n",
+                   tot_size / 1024 / 1024 / 1024, duration.count(),
+                   tot_size / duration.count() * 1000 / 1024 / 1024 / 1024);
 
-        // Re-enable P2P peer access after data restore
+            // Re-enable P2P peer access after data restore
 #if !defined(__HIP_PLATFORM_AMD__)
-        fprintf(stderr, "[vGPU] Re-enabling P2P peer access after restore...\n");
-        ipc_reenable_all_peer_access();
+            fprintf(stderr, "[vGPU] Re-enabling P2P peer access after restore...\n");
+            ipc_reenable_all_peer_access();
 #endif
-        fprintf(stderr, "finish restore\n");
+            fprintf(stderr, "finish restore\n");
+        }
+        finish_op((ShareMemComm*)comm);
     }
+    gpu->popContext();
     comm->send_msg(FINISH_MSG);
 }
 
@@ -646,9 +1384,17 @@ void cr_ipc_signal_handler(int signum) {
         auto t_local_end = std::chrono::high_resolution_clock::now();
         auto local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_local_end - t_local).count();
 
-        // Write export info to shared memory for peers to read
+        // Write export info to shared memory for peers to read.
+        // Deferred mode: this materializes the buffer at the floor size
+        // (IPC verbs are buffer-path ops — KEP-0002 NEW-1).
         auto t_shm = std::chrono::high_resolution_clock::now();
         void* tmp_buf = backend->get_tmp_buf();
+        if (!tmp_buf) {
+            fprintf(stderr, "[vGPU-IPC] ERROR: dump buffer unavailable for export blocks; aborting phase\n");
+            comm->send_msg(FINISH_MSG);
+            fflush(stderr);
+            return;
+        }
         shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
         IpcRebuildShmBlock* my_block = (IpcRebuildShmBlock*)((char*)tmp_buf +
             ROUND_UP_2MB(sizeof(shared_mem_fs)) - sizeof(IpcRebuildShmBlock));
@@ -676,6 +1422,12 @@ void cr_ipc_signal_handler(int signum) {
         auto t0 = std::chrono::high_resolution_clock::now();
 
         void* tmp_buf = backend->get_tmp_buf();
+        if (!tmp_buf) {
+            fprintf(stderr, "[vGPU-IPC] ERROR: dump buffer unavailable for import blocks; aborting phase\n");
+            comm->send_msg(FINISH_MSG);
+            fflush(stderr);
+            return;
+        }
         IpcRebuildShmBlock* peer_block = (IpcRebuildShmBlock*)((char*)tmp_buf +
             ROUND_UP_2MB(sizeof(shared_mem_fs)) - sizeof(IpcRebuildShmBlock) * 2);
 
@@ -729,6 +1481,11 @@ void cr_ipc_signal_handler(int signum) {
 // Library constructor: register all signal handlers
 // ---------------------------------------------------------------------------
 __attribute__((constructor)) void init() {
+    // KEP-0002: resolve buffer config FIRST — a function-local-static
+    // singleton invoked here (not a second ELF constructor, whose order vs
+    // this one would be unspecified). Signal handlers only read the cache.
+    const GpuCrBufConfig& buf_cfg = gpu_cr_config();
+
     fprintf(stderr, "[vGPU] Library loaded! Registering signal handlers...\n");
     fprintf(stderr, "[vGPU] Multi-GPU CR support enabled (IPC hook mode)\n");
     fflush(stderr);
@@ -737,6 +1494,42 @@ __attribute__((constructor)) void init() {
     signal(CR_INIT_SIGNAL, cr_signal_handler);
     signal(CR_CKPT_SIGNAL, cr_signal_handler);
     signal(CR_RESTORE_SIGNAL, cr_signal_handler);
+
+    // GEP-0006 readiness advertisement: written HERE, in the same
+    // constructor that installs the handlers, so its existence proves the
+    // signals above are safe to send — cr_client refuses to kill() without
+    // it. starttime makes the file self-invalidating across PID reuse.
+    // Never written in legacy mode (a disk-backed dir could be shadowed by
+    // a later tmpfs mount, stranding a stale advertisement). Failures are
+    // logged, never fatal: this must not take down the workload.
+    {
+        int ctl_mode = 0;
+        const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
+        if (ctl_mode) {
+            char ready_path[512];
+            char content[600];
+            snprintf(ready_path, sizeof(ready_path), "%s/ctl-ready-%d", ctl_dir, getpid());
+            // shm_mb/staging_mb/deferred: additive keys (KEP-0002) so the
+            // agent can OBSERVE workload buffer sizing and cross-check it
+            // against pod hugepage requests — closing the observability
+            // corner of the three-way consistency triangle.
+            int content_len = snprintf(content, sizeof(content),
+                                       "proto=%d starttime=%lld ctl=%s shm_mb=%zu staging_mb=%zu deferred=%d\n",
+                                       GPU_CR_CTL_PROTO, gpu_cr_starttime(getpid()), ctl_dir,
+                                       buf_cfg.shm_size >> 20, buf_cfg.staging_size >> 20,
+                                       buf_cfg.shm_deferred ? 1 : 0);
+            int fd = open(ready_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+            if (fd >= 0) {
+                if (write(fd, content, content_len) != content_len)
+                    fprintf(stderr, "[vGPU] WARNING: short write to %s (%s)\n", ready_path, strerror(errno));
+                close(fd);
+                fprintf(stderr, "[vGPU] ctl-ready advertisement written: %s\n", ready_path);
+            } else {
+                fprintf(stderr, "[vGPU] WARNING: cannot write %s (%s) — cr_client will refuse ops\n",
+                        ready_path, strerror(errno));
+            }
+        }
+    }
 
     // Multi-GPU IPC teardown/rebuild signals (replaces NCCL suspend/resume)
     signal(CR_IPC_TEARDOWN_SIGNAL, cr_ipc_signal_handler);
