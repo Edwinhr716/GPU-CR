@@ -19,6 +19,7 @@
 
 #include "common.h"
 #include "ctl_path.h"
+#include "dump_format.h"
 #include "comm/comm.h"
 #include "backend/backend.h"
 #include "GPUs/GPU.h"
@@ -68,18 +69,10 @@ void memcpy_multi(void* dest, void* src, size_t size) {
     }
 }
 
-// GEP-0005 §3: the driver rejects a cudaMemcpyAsync on a hooked VMM mapping
-// when the copy crosses a 2MB granule boundary with an unrounded length
-// (nv.cpp:133 "invalid argument" at 4B/rank-64; see
-// docs/proposals/0005-multi-handle-unrounded-dumps.md). Clamp each device
-// copy so it ends at the next granule boundary or at the region end: every
-// issued copy is <=2MB and granule-aligned at its start or its end — the
-// copy shapes validated at scale. Applies to the selective (unrounded)
-// paths only; the full-checkpoint paths copy rounded extents and never hit
-// this boundary.
-static inline size_t granule_clamp(const void* dev_ptr, size_t len) {
-    size_t to_boundary = VMM_GRANULE_SIZE - ((uintptr_t)dev_ptr & (VMM_GRANULE_SIZE - 1));
-    return len < to_boundary ? len : to_boundary;
+// Pointer-typed convenience wrapper over the GEP-0005 §3 clamp (the math
+// lives in common.h as gpu_cr::GranuleClampLen so it is unit-testable).
+static inline size_t GranuleClamp(const void* dev_ptr, size_t len) {
+    return gpu_cr::GranuleClampLen(reinterpret_cast<uintptr_t>(dev_ptr), len);
 }
 
 
@@ -119,7 +112,7 @@ double ckpt() {
         if (required > SHM_SIZE) {
             fprintf(stderr, "[vGPU-CKPT] Error: checkpoint needs %zu MiB but the dump buffer is "
                             "%zu MiB (GPU_CR_SHM_GB/MB); failing cleanly\n",
-                    required >> 20, (size_t)SHM_SIZE >> 20);
+                    required >> 20, static_cast<size_t>(SHM_SIZE) >> 20);
             g_op_status = ENOSPC;
             fs_mutex.unlock();
             return -1;
@@ -266,9 +259,10 @@ double ckpt() {
     return tot_size;
 }
 
-bool find_containing_allocation(void* ptr, void** base_ptr, size_t* alloc_size) {
+static bool FindContainingAllocation(void* ptr, void** base_ptr, size_t* alloc_size) {
     for (auto const& [alloc_ptr, size] : allocated_memory) {
-        if (ptr >= alloc_ptr && (char*)ptr < (char*)alloc_ptr + size) {
+        if (ptr >= alloc_ptr &&
+            static_cast<char*>(ptr) < static_cast<char*>(alloc_ptr) + size) {
             *base_ptr = alloc_ptr;
             *alloc_size = size;
             return true;
@@ -285,7 +279,7 @@ bool find_containing_allocation(void* ptr, void** base_ptr, size_t* alloc_size) 
 // dest-path failures set g_op_status and return instead of exit(-1) —
 // the workload must survive a bad path or a full store.
 // ---------------------------------------------------------------------------
-#define HUGETLBFS_FS_MAGIC 0x958458f6
+constexpr unsigned long kHugetlbfsMagic = 0x958458f6;
 
 static uint64_t g_dump_generation = 0;
 
@@ -297,14 +291,14 @@ struct DestMap {
     bool   hugetlb = false;
 };
 
-static void dest_close(DestMap* dm) {
+static void DestClose(DestMap* dm) {
     if (dm->addr && dm->addr != MAP_FAILED) munmap(dm->addr, dm->map_size);
     if (dm->fd >= 0) close(dm->fd);
     dm->addr = nullptr;
     dm->fd = -1;
 }
 
-static bool dest_open_common(const char* path, int prot, DestMap* dm) {
+static bool DestOpenCommon(const char* path, int prot, DestMap* dm) {
     // Never O_CREAT: existence is the caller's responsibility, and creating
     // here would let a stale dest_path materialize files (GEP-0001 F2).
     dm->fd = open(path, (prot & PROT_WRITE) ? O_RDWR : O_RDONLY);
@@ -314,37 +308,37 @@ static bool dest_open_common(const char* path, int prot, DestMap* dm) {
         return false;
     }
     struct statfs sfs;
-    if (fstatfs(dm->fd, &sfs) == 0 && (unsigned long)sfs.f_type == HUGETLBFS_FS_MAGIC)
+    if (fstatfs(dm->fd, &sfs) == 0 && static_cast<unsigned long>(sfs.f_type) == kHugetlbfsMagic)
         dm->hugetlb = true;
     return true;
 }
 
-static bool dest_open_for_ckpt(const char* path, size_t total, DestMap* dm) {
-    if (!dest_open_common(path, PROT_READ | PROT_WRITE, dm)) return false;
+static bool DestOpenForCkpt(const char* path, size_t total, DestMap* dm) {
+    if (!DestOpenCommon(path, PROT_READ | PROT_WRITE, dm)) return false;
     // tmpfs/disk reserve nothing at ftruncate or mmap: without fallocate a
     // full filesystem is a SIGBUS mid-store, not an error. hugetlbfs
     // reserves at mmap, so ENOMEM already surfaces there.
     if (!dm->hugetlb) {
-        int rc = posix_fallocate(dm->fd, 0, (off_t)total);
+        int rc = posix_fallocate(dm->fd, 0, static_cast<off_t>(total));
         if (rc != 0) {
             g_op_status = rc;
             fprintf(stderr, "[vGPU-DEST] fallocate(%s, %zu) failed: %s\n", path, total, strerror(rc));
-            dest_close(dm);
+            DestClose(dm);
             return false;
         }
     }
     size_t fsize = dm->hugetlb ? ROUND_UP_2MB(total) : total;
-    if (ftruncate(dm->fd, (off_t)fsize) < 0) {
+    if (ftruncate(dm->fd, static_cast<off_t>(fsize)) < 0) {
         g_op_status = errno;
         fprintf(stderr, "[vGPU-DEST] ftruncate(%s, %zu) failed: %s\n", path, fsize, strerror(errno));
-        dest_close(dm);
+        DestClose(dm);
         return false;
     }
-    dm->addr = mmap(NULL, fsize, PROT_READ | PROT_WRITE, MAP_SHARED, dm->fd, 0);
+    dm->addr = mmap(nullptr, fsize, PROT_READ | PROT_WRITE, MAP_SHARED, dm->fd, 0);
     if (dm->addr == MAP_FAILED) {
         g_op_status = errno;
         fprintf(stderr, "[vGPU-DEST] mmap(%s, %zu) failed: %s\n", path, fsize, strerror(errno));
-        dest_close(dm);
+        DestClose(dm);
         return false;
     }
     dm->map_size = fsize;
@@ -354,54 +348,54 @@ static bool dest_open_for_ckpt(const char* path, size_t total, DestMap* dm) {
 
 // Restore side: refuse anything without a valid header and commit marker —
 // a torn dump must fail the op, not feed garbage to the GPU (GEP-0001 F7).
-static bool dest_open_for_restore(const char* path, DestMap* dm) {
-    if (!dest_open_common(path, PROT_READ, dm)) return false;
+static bool DestOpenForRestore(const char* path, DestMap* dm) {
+    if (!DestOpenCommon(path, PROT_READ, dm)) return false;
     struct stat st;
     if (fstat(dm->fd, &st) < 0) {
         g_op_status = errno;
-        dest_close(dm);
+        DestClose(dm);
         return false;
     }
-    size_t min_size = ROUND_UP_2MB(sizeof(shared_mem_fs)) + sizeof(dump_commit);
-    if ((size_t)st.st_size < min_size) {
+    size_t min_size = ROUND_UP_2MB(sizeof(shared_mem_fs)) + sizeof(DumpCommit);
+    if (static_cast<size_t>(st.st_size) < min_size) {
         g_op_status = EINVAL;
-        fprintf(stderr, "[vGPU-DEST] %s too small (%lld bytes) to hold a dump\n", path, (long long)st.st_size);
-        dest_close(dm);
+        fprintf(stderr, "[vGPU-DEST] %s too small (%lld bytes) to hold a dump\n", path,
+                static_cast<long long>(st.st_size));
+        DestClose(dm);
         return false;
     }
-    dm->addr = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, dm->fd, 0);
+    dm->addr = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, dm->fd, 0);
     if (dm->addr == MAP_FAILED) {
         g_op_status = errno;
         fprintf(stderr, "[vGPU-DEST] mmap(%s) failed: %s\n", path, strerror(errno));
-        dest_close(dm);
+        DestClose(dm);
         return false;
     }
     dm->map_size = st.st_size;
     dm->capacity = st.st_size;
 
-    shared_mem_fs* fs = (shared_mem_fs*)dm->addr;
-    uint64_t hdr = ROUND_UP_2MB(sizeof(shared_mem_fs));
-    if (fs->file_num == 0 || fs->file_num >= MAX_FILE_NUM ||
-        fs->current_offset < hdr ||
-        fs->current_offset + sizeof(dump_commit) > dm->map_size) {
+    shared_mem_fs* fs = static_cast<shared_mem_fs*>(dm->addr);
+    if (!gpu_cr::DumpHeaderPlausible(fs->file_num, fs->current_offset, dm->map_size)) {
         g_op_status = EINVAL;
         fprintf(stderr, "[vGPU-DEST] %s has implausible header (file_num=%llu current_offset=%llu)\n",
-                path, (unsigned long long)fs->file_num, (unsigned long long)fs->current_offset);
-        dest_close(dm);
+                path, static_cast<unsigned long long>(fs->file_num),
+                static_cast<unsigned long long>(fs->current_offset));
+        DestClose(dm);
         return false;
     }
-    const dump_commit* dc = (const dump_commit*)((const char*)dm->addr + fs->current_offset);
-    if (dc->magic != DUMP_COMMIT_MAGIC) {
+    const DumpCommit* dc = reinterpret_cast<const DumpCommit*>(
+        static_cast<const char*>(dm->addr) + fs->current_offset);
+    if (dc->magic != gpu_cr::kDumpCommitMagic) {
         g_op_status = EINVAL;
         fprintf(stderr, "[vGPU-DEST] %s has no commit marker: torn or foreign dump, refusing restore\n", path);
-        dest_close(dm);
+        DestClose(dm);
         return false;
     }
     return true;
 }
 
-double ckpt_selective(const selective_cr_request* req) {
-    const char* dest_path = (req->proto_version >= SELECTIVE_CR_PROTO_V2 && req->dest_path[0] != '\0')
+double ckpt_selective(const SelectiveCrRequest* req) {
+    const char* dest_path = (req->proto_version >= gpu_cr::kSelectiveCrProtoV2 && req->dest_path[0] != '\0')
                                 ? req->dest_path : nullptr;
     fprintf(stderr, "[vGPU-SELECTIVE-CKPT] ckpt_selective() entered, %u regions, PID=%d, dest=%s\n",
             req->num_regions, getpid(), dest_path ? dest_path : "(per-PID buffer)");
@@ -428,7 +422,7 @@ double ckpt_selective(const selective_cr_request* req) {
         void* d = req->regions[ri].ptr;
         void* base_ptr = nullptr;
         size_t alloc_size = 0;
-        if (find_containing_allocation(d, &base_ptr, &alloc_size)) {
+        if (FindContainingAllocation(d, &base_ptr, &alloc_size)) {
             blocks_to_snapshot.insert(base_ptr);
         } else {
             fprintf(stderr, "[vGPU-SELECTIVE-CKPT] WARNING: ptr %p not in any allocated memory block, skipping\n", d);
@@ -443,14 +437,14 @@ double ckpt_selective(const selective_cr_request* req) {
     shared_mem_fs* fs;
     size_t fs_capacity; // extent bound: header + extents, excluding the marker
     if (dest_path) {
-        if (!dest_open_for_ckpt(dest_path, dump_total + sizeof(dump_commit), &dm)) {
+        if (!DestOpenForCkpt(dest_path, dump_total + sizeof(DumpCommit), &dm)) {
             fs_mutex.unlock();
             return -1;
         }
-        fs = (shared_mem_fs*)dm.addr;
+        fs = static_cast<shared_mem_fs*>(dm.addr);
         fs_capacity = dump_total;
     } else {
-        fs = (shared_mem_fs*)backend->get_tmp_buf();
+        fs = static_cast<shared_mem_fs*>(backend->get_tmp_buf());
         if (!fs) {
             fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: dump buffer unavailable (deferred-mode "
                             "materialization failed?)\n");
@@ -481,7 +475,7 @@ double ckpt_selective(const selective_cr_request* req) {
         fprintf(stderr, "Error: Failed to create stream\n");
         if (dest_path) {
             g_op_status = EIO;
-            dest_close(&dm);
+            DestClose(&dm);
             fs_mutex.unlock();
             return -1;
         }
@@ -493,7 +487,7 @@ double ckpt_selective(const selective_cr_request* req) {
         gpu->destroyStream(stream);
         if (dest_path) {
             g_op_status = EIO;
-            dest_close(&dm);
+            DestClose(&dm);
             fs_mutex.unlock();
             return -1;
         }
@@ -530,7 +524,7 @@ double ckpt_selective(const selective_cr_request* req) {
             gpu->destroyEvent(event);
             if (dest_path) {
                 g_op_status = ENOSPC;
-                dest_close(&dm);
+                DestClose(&dm);
                 fs_mutex.unlock();
                 return -1;
             }
@@ -544,7 +538,7 @@ double ckpt_selective(const selective_cr_request* req) {
             gpu->destroyEvent(event);
             if (dest_path) {
                 g_op_status = E2BIG;
-                dest_close(&dm);
+                DestClose(&dm);
                 fs_mutex.unlock();
                 return -1;
             }
@@ -555,8 +549,8 @@ double ckpt_selective(const selective_cr_request* req) {
         void* d = base_ptr;
         while (size > 0) {
             size_t cur_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
-            cur_size = granule_clamp(d, cur_size);  // GEP-0005 §3
-            void* start_addr = (char*)staging_buf[current_buf & 1] + buf_offset;
+            cur_size = GranuleClamp(d, cur_size);  // GEP-0005 §3
+            void* start_addr = static_cast<char*>(staging_buf[current_buf & 1]) + buf_offset;
 
             if (gpu->memcpyAsync(start_addr, d, cur_size, GPUMemcpyKind::DeviceToHost, stream) != 0) {
                 fprintf(stderr, "Error: memcpyAsync failed\n");
@@ -565,7 +559,7 @@ double ckpt_selective(const selective_cr_request* req) {
             }
 
             buf_offset += cur_size;
-            d = (char*)d + cur_size;
+            d = static_cast<char*>(d) + cur_size;
             size -= cur_size;
             if (buf_offset >= STAGING_BUF_SIZE) {
                 assert(buf_offset == STAGING_BUF_SIZE);
@@ -576,7 +570,7 @@ double ckpt_selective(const selective_cr_request* req) {
                     sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
 
                     auto t5 = std::chrono::high_resolution_clock::now();
-                    memcpy_multi((char*)fs + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
+                    memcpy_multi(reinterpret_cast<char*>(fs) + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
                     auto t6 = std::chrono::high_resolution_clock::now();
                     cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
 
@@ -596,7 +590,7 @@ double ckpt_selective(const selective_cr_request* req) {
         sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
 
         auto t5 = std::chrono::high_resolution_clock::now();
-        memcpy_multi((char*)fs + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
+        memcpy_multi(reinterpret_cast<char*>(fs) + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
         auto t6 = std::chrono::high_resolution_clock::now();
         cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
 
@@ -609,7 +603,7 @@ double ckpt_selective(const selective_cr_request* req) {
     sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
 
     auto t9 = std::chrono::high_resolution_clock::now();
-    memcpy_multi((char*)fs + des_offset, staging_buf[current_buf & 1], buf_offset);
+    memcpy_multi(reinterpret_cast<char*>(fs) + des_offset, staging_buf[current_buf & 1], buf_offset);
     auto t10 = std::chrono::high_resolution_clock::now();
     cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t10 - t9).count();
 
@@ -620,10 +614,12 @@ double ckpt_selective(const selective_cr_request* req) {
     // Commit marker AFTER the last extent landed: restores refuse dumps
     // without it, so a crash anywhere above leaves a detectably-torn file.
     // The magic is stored last so a marker is never observed half-written.
-    if (fs->current_offset + sizeof(dump_commit) <= (dest_path ? dm.capacity : (size_t)SHM_SIZE)) {
-        dump_commit* dc = (dump_commit*)((char*)fs + fs->current_offset);
+    if (fs->current_offset + sizeof(DumpCommit) <=
+            (dest_path ? dm.capacity : static_cast<size_t>(SHM_SIZE))) {
+        DumpCommit* dc = reinterpret_cast<DumpCommit*>(
+            reinterpret_cast<char*>(fs) + fs->current_offset);
         dc->generation = ++g_dump_generation;
-        dc->magic = DUMP_COMMIT_MAGIC;
+        dc->magic = gpu_cr::kDumpCommitMagic;
     }
 
     fprintf(stderr, "Releasing physical GPU memory for %lu selective regions...\n", (unsigned long)fs->file_num);
@@ -634,7 +630,7 @@ double ckpt_selective(const selective_cr_request* req) {
             fprintf(stderr, "Error: Failed to release physical memory for ptr %p\n", ptr);
             if (dest_path) {
                 g_op_status = EIO;
-                dest_close(&dm);
+                DestClose(&dm);
                 fs_mutex.unlock();
                 return -1;
             }
@@ -659,7 +655,7 @@ double ckpt_selective(const selective_cr_request* req) {
             tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (data_transfer_time / 1000000.0) : 0.0);
     fprintf(stderr, "===============================================\n");
 
-    if (dest_path) dest_close(&dm);
+    if (dest_path) DestClose(&dm);
     fs_mutex.unlock();
     return tot_size;
 }
@@ -788,8 +784,8 @@ double restore_ptr_and_content() {
     return tot_size;
 }
 
-double restore_ptr_and_content_selective(const selective_cr_request* req) {
-    const char* dest_path = (req->proto_version >= SELECTIVE_CR_PROTO_V2 && req->dest_path[0] != '\0')
+double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
+    const char* dest_path = (req->proto_version >= gpu_cr::kSelectiveCrProtoV2 && req->dest_path[0] != '\0')
                                 ? req->dest_path : nullptr;
     std::lock_guard<std::mutex> lock(gpu_mem_mutex);
     double tot_size = 0;
@@ -799,8 +795,8 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
     DestMap dm;
     shared_mem_fs* fs;
     if (dest_path) {
-        if (!dest_open_for_restore(dest_path, &dm)) return -1;
-        fs = (shared_mem_fs*)dm.addr;
+        if (!DestOpenForRestore(dest_path, &dm)) return -1;
+        fs = static_cast<shared_mem_fs*>(dm.addr);
         // Cross-check the request against the dump (GEP-0001 F7): every
         // requested region must resolve to a live allocation whose base is
         // one of the dump's files — the header is otherwise trusted input
@@ -808,11 +804,11 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
         for (uint32_t ri = 0; ri < req->num_regions; ri++) {
             void* base_ptr = nullptr;
             size_t alloc_size = 0;
-            if (!find_containing_allocation(req->regions[ri].ptr, &base_ptr, &alloc_size)) {
+            if (!FindContainingAllocation(req->regions[ri].ptr, &base_ptr, &alloc_size)) {
                 fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] region ptr %p not in any live allocation\n",
                         req->regions[ri].ptr);
                 g_op_status = EINVAL;
-                dest_close(&dm);
+                DestClose(&dm);
                 return -1;
             }
             bool in_dump = false;
@@ -822,12 +818,12 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
                 fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] region ptr %p (block %p) absent from dump %s\n",
                         req->regions[ri].ptr, base_ptr, dest_path);
                 g_op_status = EINVAL;
-                dest_close(&dm);
+                DestClose(&dm);
                 return -1;
             }
         }
     } else {
-        fs = (shared_mem_fs*)backend->get_tmp_buf();
+        fs = static_cast<shared_mem_fs*>(backend->get_tmp_buf());
         if (!fs) {
             fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: dump buffer unavailable (deferred-mode "
                             "materialization failed?)\n");
@@ -849,7 +845,7 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
             fprintf(stderr, "Error: Failed to remap physical memory for ptr %p\n", ptr);
             if (dest_path) {
                 g_op_status = EIO;
-                dest_close(&dm);
+                DestClose(&dm);
                 return -1;
             }
             exit(-1);
@@ -865,7 +861,7 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
         fprintf(stderr, "Error: Failed to create stream\n");
         if (dest_path) {
             g_op_status = EIO;
-            dest_close(&dm);
+            DestClose(&dm);
             return -1;
         }
         exit(-1);
@@ -875,7 +871,7 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
         gpu->destroyStream(stream);
         if (dest_path) {
             g_op_status = EIO;
-            dest_close(&dm);
+            DestClose(&dm);
             return -1;
         }
         exit(-1);
@@ -887,7 +883,7 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
     size_t src_offset = 0;
 
     for (uint64_t i = 0; i < file_num; i++) {
-        void* requestedAddr = fs->files[i].ptr;
+        void* requested_addr = fs->files[i].ptr;
         uint64_t offset = fs->files[i].start_offset;
         uint64_t size = fs->files[i].size;
         tot_size += size;
@@ -896,7 +892,7 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
             src_offset = fs->files[i].start_offset;
             size_t cpu_copy_size = std::min((size_t)(fs->current_offset - src_offset), (size_t)STAGING_BUF_SIZE);
             auto tc1 = std::chrono::high_resolution_clock::now();
-            memcpy_multi(staging_buf[current_buf & 1], (char*)fs + src_offset, cpu_copy_size);
+            memcpy_multi(staging_buf[current_buf & 1], reinterpret_cast<char*>(fs) + src_offset, cpu_copy_size);
             auto tc2 = std::chrono::high_resolution_clock::now();
             cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(tc2 - tc1).count();
             buf_offset = 0;
@@ -904,17 +900,17 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
 
         while (size > 0) {
             size_t this_copy_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
-            this_copy_size = granule_clamp(requestedAddr, this_copy_size);  // GEP-0005 §3
+            this_copy_size = GranuleClamp(requested_addr, this_copy_size);  // GEP-0005 §3
             assert(buf_offset == offset - src_offset);
 
-            if (gpu->memcpyAsync(requestedAddr, (char*)staging_buf[current_buf & 1] + (offset - src_offset),
+            if (gpu->memcpyAsync(requested_addr, static_cast<char*>(staging_buf[current_buf & 1]) + (offset - src_offset),
                                this_copy_size, GPUMemcpyKind::HostToDevice, stream) != 0) {
                 fprintf(stderr, "Error: memcpyAsync failed\n");
                 if (dest_path) {
                     gpu->destroyStream(stream);
                     gpu->destroyEvent(event);
                     g_op_status = EIO;
-                    dest_close(&dm);
+                    DestClose(&dm);
                     return -1;
                 }
                 exit(-1);
@@ -922,7 +918,7 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
 
             buf_offset += this_copy_size;
             offset += this_copy_size;
-            requestedAddr = (char*)requestedAddr + this_copy_size;
+            requested_addr = static_cast<char*>(requested_addr) + this_copy_size;
             size -= this_copy_size;
 
             if (buf_offset >= STAGING_BUF_SIZE) {
@@ -936,7 +932,7 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
                 sync_time += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
 
                 auto tc3 = std::chrono::high_resolution_clock::now();
-                memcpy_multi(staging_buf[(current_buf + 1) & 1], (char*)fs + src_offset, cpu_copy_size);
+                memcpy_multi(staging_buf[(current_buf + 1) & 1], reinterpret_cast<char*>(fs) + src_offset, cpu_copy_size);
                 auto tc4 = std::chrono::high_resolution_clock::now();
                 cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(tc4 - tc3).count();
 
@@ -968,14 +964,14 @@ double restore_ptr_and_content_selective(const selective_cr_request* req) {
             tot_size > 0 ? (tot_size / (1024.0*1024*1024)) / (data_transfer_time / 1000000.0) : 0.0);
     fprintf(stderr, "============================================\n");
 
-    if (dest_path) dest_close(&dm);
+    if (dest_path) DestClose(&dm);
     return tot_size;
 }
 
 int get_id() {
     char id_name[512];
-    int ctl_mode = 0;
-    const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
+    bool ctl_mode = false;
+    const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
     snprintf(id_name, sizeof(id_name), "%s/control", ctl_dir);
     int fd_id = open(id_name, O_CREAT | O_RDWR, 0755);
     if (fd_id < 0) {
@@ -992,13 +988,14 @@ int get_id() {
         exit(EXIT_FAILURE);
     }
     if (ctl_mode) {
-        int rc = posix_fallocate(fd_id, 0, (off_t)id_size);
+        int rc = posix_fallocate(fd_id, 0, static_cast<off_t>(id_size));
         if (rc != 0) {
             fprintf(stderr, "posix_fallocate(%s): %s (ctl tmpfs full?)\n", id_name, strerror(rc));
             exit(EXIT_FAILURE);
         }
     }
-    std::atomic<int>* id_ptr = (std::atomic<int>*)mmap(NULL, id_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_id, 0);
+    std::atomic<int>* id_ptr = static_cast<std::atomic<int>*>(
+        mmap(nullptr, id_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_id, 0));
     if (id_ptr == MAP_FAILED) {
         perror("mmap()");
         exit(EXIT_FAILURE);
@@ -1021,8 +1018,8 @@ void init_CR() {
     // Write PID -> ID mapping file. write(2), not stdio: buffered stdio
     // silently produces an EMPTY file on hugetlbfs (the historical pid_map
     // bug); on the ctl tmpfs plain writes just work.
-    int ctl_mode = 0;
-    const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
+    bool ctl_mode = false;
+    const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
     char map_name[512];
     snprintf(map_name, sizeof(map_name), "%s/pid_map_%d", ctl_dir, getpid());
     int fd_map = open(map_name, O_CREAT | O_TRUNC | O_WRONLY, 0666);
@@ -1045,7 +1042,7 @@ void init_CR() {
     comm->setup();
     // Publish dest-path capability (GEP-0001). Persistent across ops: the
     // consume-once zeroing at FINISH deliberately leaves this word alone.
-    ((ShareMemComm*)comm)->control->capability |= CR_CAP_DEST_PATH;
+    (static_cast<ShareMemComm*>(comm))->control->capability |= gpu_cr::kCrCapDestPath;
     backend = new ShareMem(id);
     backend->setup();
     gpu = createGPU();  // createGPU() will detect the GPU vendor and return the appropriate GPU object
@@ -1080,13 +1077,8 @@ void init_CR() {
 // dest_path can never redirect a later op (a v1 cr_client only rewrites
 // the v1 prefix). v2 clients gate cuda-checkpoint --toggle on op_status —
 // never freeze a process whose state was not saved.
-static void finish_op(ShareMemComm* scomm) {
-    signal_controls* c = scomm->control;
-    c->op_status = g_op_status;
-    c->proto_ack = SELECTIVE_CR_PROTO_V2;
-    c->selective_req.proto_version = 0;
-    memset(c->selective_req.dest_path, 0, SELECTIVE_CR_MAX_PATH);
-    c->capability |= CR_CAP_DEST_PATH;
+static void FinishOp(ShareMemComm* scomm) {
+    gpu_cr::FinishOpControls(scomm->control, g_op_status);
 }
 
 void cr_signal_handler(int signum) {
@@ -1121,8 +1113,8 @@ void cr_signal_handler(int signum) {
     uint32_t msg = comm->recv_msg();
     gpu->pushContext();
     if(msg == SELECTIVE_CKPT_MSG) {
-        ShareMemComm* scomm = (ShareMemComm*)comm;
-        const selective_cr_request* req = &scomm->control->selective_req;
+        ShareMemComm* scomm = static_cast<ShareMemComm*>(comm);
+        const SelectiveCrRequest* req = &scomm->control->selective_req;
         g_op_status = 0;
         fprintf(stderr, "waiting for kernels to finish...\n");
         gpu->syncAllKernels();
@@ -1137,10 +1129,10 @@ void cr_signal_handler(int signum) {
             fprintf(stderr, "selective ckpt size: %f GB, time: %ld ms, bw: %f GB/s\n",
                    tot_size / 1024 / 1024 / 1024, duration.count(),
                    duration.count() > 0 ? tot_size / duration.count() * 1000 / 1024 / 1024 / 1024 : 0.0);
-        finish_op(scomm);
+        FinishOp(scomm);
     } else if(msg == SELECTIVE_RESTORE_MSG) {
-        ShareMemComm* scomm = (ShareMemComm*)comm;
-        const selective_cr_request* req = &scomm->control->selective_req;
+        ShareMemComm* scomm = static_cast<ShareMemComm*>(comm);
+        const SelectiveCrRequest* req = &scomm->control->selective_req;
         g_op_status = 0;
         fprintf(stderr, "start selective restore...\n");
         auto start = std::chrono::high_resolution_clock::now();
@@ -1153,7 +1145,7 @@ void cr_signal_handler(int signum) {
             fprintf(stderr, "selective restore size: %f GB, time: %ld ms, bw: %f GB/s\n",
                    tot_size / 1024 / 1024 / 1024, duration.count(),
                    duration.count() > 0 ? tot_size / duration.count() * 1000 / 1024 / 1024 / 1024 : 0.0);
-        finish_op(scomm);
+        FinishOp(scomm);
     } else if(msg == CKPT_MSG) {
         g_op_status = 0;
         fprintf(stderr, "waiting for kernels to finish...\n");
@@ -1183,7 +1175,7 @@ void cr_signal_handler(int signum) {
             // Note: External checkpoint (cuda-checkpoint for NVIDIA, CRIU for AMD)
             // is called from cr_client, not here
         }
-        finish_op((ShareMemComm*)comm);
+        FinishOp(static_cast<ShareMemComm*>(comm));
     } else if (msg == RESTORE_MSG) {
         g_op_status = 0;
         // Note: cuda-checkpoint restore was already called by cr_client before this signal
@@ -1206,7 +1198,7 @@ void cr_signal_handler(int signum) {
 #endif
             fprintf(stderr, "finish restore\n");
         }
-        finish_op((ShareMemComm*)comm);
+        FinishOp(static_cast<ShareMemComm*>(comm));
     }
     gpu->popContext();
     comm->send_msg(FINISH_MSG);
@@ -1484,7 +1476,7 @@ __attribute__((constructor)) void init() {
     // KEP-0002: resolve buffer config FIRST — a function-local-static
     // singleton invoked here (not a second ELF constructor, whose order vs
     // this one would be unspecified). Signal handlers only read the cache.
-    const GpuCrBufConfig& buf_cfg = gpu_cr_config();
+    const gpu_cr::BufConfig& buf_cfg = gpu_cr::Config();
 
     fprintf(stderr, "[vGPU] Library loaded! Registering signal handlers...\n");
     fprintf(stderr, "[vGPU] Multi-GPU CR support enabled (IPC hook mode)\n");
@@ -1503,31 +1495,17 @@ __attribute__((constructor)) void init() {
     // a later tmpfs mount, stranding a stale advertisement). Failures are
     // logged, never fatal: this must not take down the workload.
     {
-        int ctl_mode = 0;
-        const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
+        bool ctl_mode = false;
+        const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
         if (ctl_mode) {
-            char ready_path[512];
-            char content[600];
-            snprintf(ready_path, sizeof(ready_path), "%s/ctl-ready-%d", ctl_dir, getpid());
             // shm_mb/staging_mb/deferred: additive keys (KEP-0002) so the
             // agent can OBSERVE workload buffer sizing and cross-check it
             // against pod hugepage requests — closing the observability
             // corner of the three-way consistency triangle.
-            int content_len = snprintf(content, sizeof(content),
-                                       "proto=%d starttime=%lld ctl=%s shm_mb=%zu staging_mb=%zu deferred=%d\n",
-                                       GPU_CR_CTL_PROTO, gpu_cr_starttime(getpid()), ctl_dir,
-                                       buf_cfg.shm_size >> 20, buf_cfg.staging_size >> 20,
-                                       buf_cfg.shm_deferred ? 1 : 0);
-            int fd = open(ready_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
-            if (fd >= 0) {
-                if (write(fd, content, content_len) != content_len)
-                    fprintf(stderr, "[vGPU] WARNING: short write to %s (%s)\n", ready_path, strerror(errno));
-                close(fd);
-                fprintf(stderr, "[vGPU] ctl-ready advertisement written: %s\n", ready_path);
-            } else {
-                fprintf(stderr, "[vGPU] WARNING: cannot write %s (%s) — cr_client will refuse ops\n",
-                        ready_path, strerror(errno));
-            }
+            if (gpu_cr::WriteAdvertisement(ctl_dir, getpid(), buf_cfg.shm_size >> 20,
+                                           buf_cfg.staging_size >> 20, buf_cfg.shm_deferred))
+                fprintf(stderr, "[vGPU] ctl-ready advertisement written: %s/ctl-ready-%d\n",
+                        ctl_dir, getpid());
         }
     }
 

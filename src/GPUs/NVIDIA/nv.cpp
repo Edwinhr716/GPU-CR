@@ -215,19 +215,19 @@ int nv::remapPhysicalMemory(void* ptr, size_t size) {
         fprintf(stderr, "[NVIDIA] Pointer %p is already mapped, releasing old physical memory first...\n", ptr);
         size_t old_size = it->second;
         size_t old_aligned_size = ROUND_UP_2MB(old_size);
-        CUdeviceptr cuptr = (CUdeviceptr)ptr;
+        CUdeviceptr cuptr = reinterpret_cast<CUdeviceptr>(ptr);
         CUresult res = cuMemUnmap(cuptr, old_aligned_size);
         if (res != CUDA_SUCCESS) {
-            const char* errorStr;
-            cuGetErrorString(res, &errorStr);
-            fprintf(stderr, "[NVIDIA] cuMemUnmap failed during remap: %s\n", errorStr);
+            const char* error_str;
+            cuGetErrorString(res, &error_str);
+            fprintf(stderr, "[NVIDIA] cuMemUnmap failed during remap: %s\n", error_str);
             return -1;
         }
         res = cuMemRelease(handle_it->second);
         if (res != CUDA_SUCCESS) {
-            const char* errorStr;
-            cuGetErrorString(res, &errorStr);
-            fprintf(stderr, "[NVIDIA] cuMemRelease failed during remap: %s\n", errorStr);
+            const char* error_str;
+            cuGetErrorString(res, &error_str);
+            fprintf(stderr, "[NVIDIA] cuMemRelease failed during remap: %s\n", error_str);
             return -1;
         }
         global_handle_map.erase(handle_it);
@@ -300,9 +300,9 @@ int nv::pushContext() {
     }
     CUresult res = cuCtxPushCurrent(target_context);
     if (res != CUDA_SUCCESS) {
-        const char* errorStr;
-        cuGetErrorString(res, &errorStr);
-        fprintf(stderr, "[NVIDIA] cuCtxPushCurrent failed: %s\n", errorStr);
+        const char* error_str;
+        cuGetErrorString(res, &error_str);
+        fprintf(stderr, "[NVIDIA] cuCtxPushCurrent failed: %s\n", error_str);
         return -1;
     }
     return 0;
@@ -312,9 +312,9 @@ int nv::popContext() {
     CUcontext popped;
     CUresult res = cuCtxPopCurrent(&popped);
     if (res != CUDA_SUCCESS) {
-        const char* errorStr;
-        cuGetErrorString(res, &errorStr);
-        fprintf(stderr, "[NVIDIA] cuCtxPopCurrent failed: %s\n", errorStr);
+        const char* error_str;
+        cuGetErrorString(res, &error_str);
+        fprintf(stderr, "[NVIDIA] cuCtxPopCurrent failed: %s\n", error_str);
         return -1;
     }
     fprintf(stderr, "[NVIDIA] Popped context: %p\n", popped);

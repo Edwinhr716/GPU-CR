@@ -1,0 +1,4 @@
+# Google C++ style (https://google.github.io/styleguide/cppguide.html).
+# New files follow this directly; when editing pre-existing 4-space files,
+# match their local indentation per the guide's consistency rule.
+BasedOnStyle: Google

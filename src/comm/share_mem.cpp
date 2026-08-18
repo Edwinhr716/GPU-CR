@@ -29,8 +29,8 @@ ShareMemComm::~ShareMemComm() {
 
 void ShareMemComm::setup() {
     char control_name[512];
-    int ctl_mode = 0;
-    const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
+    bool ctl_mode = false;
+    const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
     snprintf(control_name, sizeof(control_name), "%s/control-%d", ctl_dir, pid);
     // 0777: the coordinator (agent container) and the workload run as
     // different users in different containers but share this file.
@@ -53,7 +53,9 @@ void ShareMemComm::setup() {
         // the sparse 2MiB tail keeps the legacy file layout for free.
         // cr_client runs setup() first, so ENOSPC lands here, in the
         // coordinator, as a clean exit.
-        int rc = posix_fallocate(fd_control, 0, (off_t)ROUND_UP_4K(sizeof(signal_controls)));
+        int rc = posix_fallocate(
+            fd_control, 0,
+            static_cast<off_t>(gpu_cr::RoundUp4K(sizeof(signal_controls))));
         if (rc != 0) {
             fprintf(stderr, "posix_fallocate(%s): %s (ctl tmpfs full?)\n", control_name, strerror(rc));
             exit(EXIT_FAILURE);

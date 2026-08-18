@@ -28,7 +28,23 @@
 #ifndef RESOLVE_BENEATH
 #define RESOLVE_BENEATH 0x08ULL
 #endif
-struct gpu_cr_open_how {
+#ifdef __HIP_PLATFORM_AMD__
+// AMD platform
+#else
+#include <cuda.h>
+#endif
+
+#include "common.h"
+#include "ctl_path.h"
+#include "dump_format.h"
+#include "selective_spec.h"
+#include "comm/comm.h"
+
+namespace {
+
+// Mirror of the kernel's struct open_how (linux/openat2.h), local so old
+// kernel headers still build.
+struct OpenHow {
     uint64_t flags;
     uint64_t mode;
     uint64_t resolve;
@@ -37,19 +53,11 @@ struct gpu_cr_open_how {
 // Exit codes (consumed by the snapshot agent):
 //   0 OK, 1 usage/parse, 2 op failed (op_status or invalid dump),
 //   3 gate refused (capability/advertisement), 4 timeout.
-#define EXIT_OP_FAILED 2
-#define EXIT_REFUSED   3
-#define EXIT_TIMEOUT   4
+constexpr int kExitOpFailed = 2;
+constexpr int kExitRefused = 3;
+constexpr int kExitTimeout = 4;
 
-#ifdef __HIP_PLATFORM_AMD__
-// AMD platform 
-#else
-#include <cuda.h>
-#endif
-
-#include "common.h"
-#include "ctl_path.h"
-#include "comm/comm.h"
+}  // namespace
 
 std::string get_cuda_checkpoint_path() {
     char exe_path[1024];
@@ -72,15 +80,17 @@ std::string get_cuda_checkpoint_path() {
 }
 
 
-// Pre-create the destination file: existence only (O_CREAT), never sizing —
+namespace {
+
+// Pre-creates the destination file: existence only (O_CREAT), never sizing —
 // the .so alone can compute the dump total (GEP-0001 preloader-authoritative
 // sizing), and an inode costs no hugepages/blocks in this cgroup.
-static bool secure_precreate(const char* path) {
+bool SecurePrecreate(const char* path) {
     if (path[0] != '/') {
         fprintf(stderr, "Error: -o path must be absolute: %s\n", path);
         return false;
     }
-    char dir_buf[SELECTIVE_CR_MAX_PATH];
+    char dir_buf[gpu_cr::kSelectiveCrMaxPath];
     strncpy(dir_buf, path, sizeof(dir_buf) - 1);
     dir_buf[sizeof(dir_buf) - 1] = '\0';
     char* slash = strrchr(dir_buf, '/');
@@ -97,7 +107,7 @@ static bool secure_precreate(const char* path) {
         fprintf(stderr, "Error: cannot open destination dir %s: %s\n", dir, strerror(errno));
         return false;
     }
-    struct gpu_cr_open_how how;
+    OpenHow how;
     memset(&how, 0, sizeof(how));
     how.flags = O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW;
     how.mode = 0644;
@@ -110,29 +120,20 @@ static bool secure_precreate(const char* path) {
         fprintf(stderr, "Error: cannot create destination %s: %s\n", path, strerror(errno));
         return false;
     }
-    close((int)fd);
+    close(static_cast<int>(fd));
     return true;
 }
 
 // Post-checkpoint validation of a destination dump (GEP-0001 F1): header
 // plausibility + trailing commit marker, via read(2) — no mmap, so no
 // hugetlb reservation or fault lands in this process's cgroup.
-static bool validate_dest_dump(const char* path) {
+bool ValidateDestDump(const char* path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         fprintf(stderr, "Error: cannot reopen destination %s: %s\n", path, strerror(errno));
         return false;
     }
-    struct stat st;
-    uint64_t hdr[2]; // file_num, current_offset
-    dump_commit dc;
-    bool ok = fstat(fd, &st) == 0 &&
-              pread(fd, hdr, sizeof(hdr), 0) == (ssize_t)sizeof(hdr) &&
-              hdr[0] > 0 && hdr[0] < MAX_FILE_NUM &&
-              hdr[1] >= ROUND_UP_2MB(sizeof(shared_mem_fs)) &&
-              hdr[1] + sizeof(dump_commit) <= (uint64_t)st.st_size &&
-              pread(fd, &dc, sizeof(dc), (off_t)hdr[1]) == (ssize_t)sizeof(dc) &&
-              dc.magic == DUMP_COMMIT_MAGIC;
+    bool ok = gpu_cr::ValidateDumpFd(fd);
     close(fd);
     if (!ok)
         fprintf(stderr, "Error: destination %s failed dump validation (torn or unserved dump)\n", path);
@@ -145,7 +146,7 @@ static bool validate_dest_dump(const char* path) {
 // library level; starttime kills the PID-reuse case, where the signal
 // would terminate an innocent recycled PID. Path equality is a warning
 // only (same tmpfs may be mounted at different container paths).
-static bool check_advertisement(const char* ctl_dir, int pid) {
+bool CheckAdvertisement(const char* ctl_dir, int pid) {
     char path[512];
     snprintf(path, sizeof(path), "%s/ctl-ready-%d", ctl_dir, pid);
     FILE* f = fopen(path, "r");
@@ -161,33 +162,31 @@ static bool check_advertisement(const char* ctl_dir, int pid) {
         return false;
     }
     fclose(f);
-    int proto = 0;
-    long long adv_start = -1;
-    char adv_ctl[512] = "";
-    sscanf(buf, "proto=%d starttime=%lld ctl=%511s", &proto, &adv_start, adv_ctl);
-    if (proto < GPU_CR_CTL_PROTO) {
-        fprintf(stderr, "Error: advertisement proto=%d too low (need >=%d)\n", proto, GPU_CR_CTL_PROTO);
+    gpu_cr::Advertisement adv;
+    gpu_cr::ParseAdvertisement(buf, &adv);
+    if (adv.proto < gpu_cr::kCtlProto) {
+        fprintf(stderr, "Error: advertisement proto=%d too low (need >=%d)\n", adv.proto, gpu_cr::kCtlProto);
         return false;
     }
-    long long cur_start = gpu_cr_starttime(pid);
+    long long cur_start = gpu_cr::ProcStarttime(pid);
     if (cur_start < 0) {
         fprintf(stderr, "Error: PID %d no longer exists\n", pid);
         return false;
     }
-    if (adv_start != cur_start) {
+    if (adv.starttime != cur_start) {
         fprintf(stderr, "Error: starttime mismatch for PID %d (advertised %lld, current %lld) — "
-                        "PID reuse, refusing to signal\n", pid, adv_start, cur_start);
+                        "PID reuse, refusing to signal\n", pid, adv.starttime, cur_start);
         return false;
     }
-    if (adv_ctl[0] && strcmp(adv_ctl, ctl_dir) != 0)
+    if (adv.ctl[0] && strcmp(adv.ctl, ctl_dir) != 0)
         fprintf(stderr, "Warning: advertisement names ctl=%s, ours is %s (same backing store, "
-                        "different mount points?)\n", adv_ctl, ctl_dir);
+                        "different mount points?)\n", adv.ctl, ctl_dir);
     return true;
 }
 
-// Poll for FINISH with a deadline: a dead or wedged workload must fail this
+// Polls for FINISH with a deadline: a dead or wedged workload must fail this
 // invocation, not hang it (and the agent behind it) forever.
-static bool wait_finished(ShareMemComm* comm) {
+bool WaitFinished(ShareMemComm* comm) {
     long timeout_sec = 120;
     const char* t = getenv("GPU_CR_OP_TIMEOUT_SEC");
     if (t && atol(t) > 0) timeout_sec = atol(t);
@@ -208,63 +207,32 @@ static bool wait_finished(ShareMemComm* comm) {
 // process whose state was never saved is unrecoverable; on restore
 // failure we must not unfreeze onto stale weights. A v1 .so leaves
 // proto_ack at 0 and keeps historical behavior.
-static void check_full_result(ShareMemComm* comm, const char* what) {
-    if (comm->control->proto_ack >= SELECTIVE_CR_PROTO_V2 && comm->control->op_status != 0) {
+void CheckFullResult(ShareMemComm* comm, const char* what) {
+    if (comm->control->proto_ack >= gpu_cr::kSelectiveCrProtoV2 && comm->control->op_status != 0) {
         int32_t st = comm->control->op_status;
         fprintf(stderr, "Error: vGPU.so reported %s failure: %s (status=%d); NOT toggling cuda-checkpoint\n",
                 what, strerror(st), st);
-        exit(EXIT_OP_FAILED);
+        exit(kExitOpFailed);
     }
 }
 
 // After a selective op: surface the .so-reported status. A v2 ack with a
 // nonzero status is a clean op failure; a missing ack on a dest-path op
 // means the .so never saw the destination (v1 skew) — refuse loudly.
-static void check_selective_result(ShareMemComm* comm, const char* dest_path) {
-    if (comm->control->proto_ack >= SELECTIVE_CR_PROTO_V2) {
+void CheckSelectiveResult(ShareMemComm* comm, const char* dest_path) {
+    if (comm->control->proto_ack >= gpu_cr::kSelectiveCrProtoV2) {
         int32_t st = comm->control->op_status;
         if (st != 0) {
             fprintf(stderr, "Error: vGPU.so reported op failure: %s (status=%d)\n", strerror(st), st);
-            exit(EXIT_OP_FAILED);
+            exit(kExitOpFailed);
         }
     } else if (dest_path) {
         fprintf(stderr, "Error: no v2 ack from vGPU.so — destination path was ignored (version skew)\n");
-        exit(EXIT_REFUSED);
+        exit(kExitRefused);
     }
 }
 
-static bool parse_selective_regions(const char* spec, selective_cr_request* req) {
-    req->num_regions = 0;
-    char* buf = strdup(spec);
-    char* token = strtok(buf, ",");
-    while (token) {
-        if (req->num_regions >= MAX_SELECTIVE_REGIONS) {
-            fprintf(stderr, "Error: too many selective regions (max %d)\n", MAX_SELECTIVE_REGIONS);
-            free(buf);
-            return false;
-        }
-        char* colon = strchr(token, ':');
-        if (!colon) {
-            fprintf(stderr, "Error: invalid region format '%s' (expected ptr:size)\n", token);
-            free(buf);
-            return false;
-        }
-        *colon = '\0';
-        void* ptr = (void*)strtoull(token, nullptr, 0);
-        uint64_t size = strtoull(colon + 1, nullptr, 0);
-        if (size == 0) {
-            fprintf(stderr, "Error: region size is 0 for ptr %s\n", token);
-            free(buf);
-            return false;
-        }
-        req->regions[req->num_regions].ptr = ptr;
-        req->regions[req->num_regions].size = size;
-        req->num_regions++;
-        token = strtok(nullptr, ",");
-    }
-    free(buf);
-    return req->num_regions > 0;
-}
+}  // namespace
 
 
 int main(int argc, char* argv[]) {
@@ -322,8 +290,8 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "Error: -o requires -c or -r together with -s\n");
             exit(EXIT_FAILURE);
         }
-        if (strlen(dest_path) >= SELECTIVE_CR_MAX_PATH) {
-            fprintf(stderr, "Error: -o path exceeds %d bytes\n", SELECTIVE_CR_MAX_PATH - 1);
+        if (strlen(dest_path) >= gpu_cr::kSelectiveCrMaxPath) {
+            fprintf(stderr, "Error: -o path exceeds %zu bytes\n", gpu_cr::kSelectiveCrMaxPath - 1);
             exit(EXIT_FAILURE);
         }
     }
@@ -333,20 +301,20 @@ int main(int argc, char* argv[]) {
     // GEP-0006: a configured-but-broken ctl path is refused HERE, loudly.
     // (The .so falls back to legacy instead — it must not die — so the
     // coordinator is where the misconfiguration surfaces.)
-    int ctl_mode = 0;
-    const char* ctl_dir = gpu_cr_ctl_dir(&ctl_mode);
+    bool ctl_mode = false;
+    const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
     const char* ctl_env = getenv("GPU_CR_CTL_PATH");
     if (ctl_env && ctl_env[0] && !ctl_mode) {
         fprintf(stderr, "Error: GPU_CR_CTL_PATH=%s is missing or not tmpfs-backed "
                         "(mount-order shadowing?) — refusing to operate\n", ctl_env);
-        exit(EXIT_REFUSED);
+        exit(kExitRefused);
     }
 
     // Pre-signal gate (GEP-0006): never kill() a PID whose .so hasn't
     // advertised readiness in our ctl dir — covers not-loaded, env
     // mismatch, pre-GEP libraries and PID reuse in one check.
-    if (ctl_mode && !check_advertisement(ctl_dir, pid))
-        exit(EXIT_REFUSED);
+    if (ctl_mode && !CheckAdvertisement(ctl_dir, pid))
+        exit(kExitRefused);
 
     ShareMemComm *comm = new ShareMemComm(pid);
     comm->setup();
@@ -358,7 +326,7 @@ int main(int argc, char* argv[]) {
     // hugetlb pages, so it stays safe with a zero hugepages request.
     if (ctl_mode) {
         char legacy_lock_path[512];
-        snprintf(legacy_lock_path, sizeof(legacy_lock_path), "%s/control-%d", gpu_cr_data_dir(), pid);
+        snprintf(legacy_lock_path, sizeof(legacy_lock_path), "%s/control-%d", gpu_cr::DataDir(), pid);
         int legacy_lock_fd = open(legacy_lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         if (legacy_lock_fd >= 0) {
             if (flock(legacy_lock_fd, LOCK_EX) != 0)
@@ -374,10 +342,10 @@ int main(int argc, char* argv[]) {
     // a restore that replays stale bytes into GPU memory, which no post-op
     // check can undo. In ctl mode the advertisement (proto>=3 implies
     // dest-path support) already proved this without needing a prior -i.
-    if (dest_path && !ctl_mode && !(comm->control->capability & CR_CAP_DEST_PATH)) {
+    if (dest_path && !ctl_mode && !(comm->control->capability & gpu_cr::kCrCapDestPath)) {
         fprintf(stderr, "Error: vGPU.so has not advertised dest-path support "
                         "(run -i first, or upgrade the preloaded library)\n");
-        exit(EXIT_REFUSED);
+        exit(kExitRefused);
     }
 
     int ret;
@@ -385,11 +353,11 @@ int main(int argc, char* argv[]) {
     if(init) {
         comm->send_msg(INIT_MSG);
         kill(pid, CR_INIT_SIGNAL);
-        if (!wait_finished(comm)) exit(EXIT_TIMEOUT);
+        if (!WaitFinished(comm)) exit(kExitTimeout);
     }  else if(ckpt && selective_spec) {
-        selective_cr_request req;
+        SelectiveCrRequest req;
         memset(&req, 0, sizeof(req));
-        if (!parse_selective_regions(selective_spec, &req)) {
+        if (!gpu_cr::ParseSelectiveRegions(selective_spec, &req)) {
             fprintf(stderr, "Error: failed to parse selective regions\n");
             exit(EXIT_FAILURE);
         }
@@ -399,49 +367,49 @@ int main(int argc, char* argv[]) {
         }
         // Always write the full v2 extension (zeroed dest when -o absent) so
         // a stale dest_path from an earlier op can never survive this write.
-        req.proto_version = SELECTIVE_CR_PROTO_V2;
+        req.proto_version = gpu_cr::kSelectiveCrProtoV2;
         if (dest_path) {
-            if (!secure_precreate(dest_path)) exit(EXIT_OP_FAILED);
-            strncpy(req.dest_path, dest_path, SELECTIVE_CR_MAX_PATH - 1);
+            if (!SecurePrecreate(dest_path)) exit(kExitOpFailed);
+            strncpy(req.dest_path, dest_path, gpu_cr::kSelectiveCrMaxPath - 1);
         }
         comm->control->selective_req = req;
         comm->send_msg(SELECTIVE_CKPT_MSG);
         kill(pid, CR_CKPT_SIGNAL);
         printf("Selective dump signal sent.\n");
-        if (!wait_finished(comm)) exit(EXIT_TIMEOUT);
-        check_selective_result(comm, dest_path);
-        if (dest_path && !validate_dest_dump(dest_path)) exit(EXIT_OP_FAILED);
+        if (!WaitFinished(comm)) exit(kExitTimeout);
+        CheckSelectiveResult(comm, dest_path);
+        if (dest_path && !ValidateDestDump(dest_path)) exit(kExitOpFailed);
         printf("Selective checkpointing done\n");
     } else if(restore && selective_spec) {
-        selective_cr_request req;
+        SelectiveCrRequest req;
         memset(&req, 0, sizeof(req));
-        if (!parse_selective_regions(selective_spec, &req)) {
+        if (!gpu_cr::ParseSelectiveRegions(selective_spec, &req)) {
             fprintf(stderr, "Error: failed to parse selective regions\n");
             exit(EXIT_FAILURE);
         }
         printf("Selective restore: %u regions\n", req.num_regions);
-        req.proto_version = SELECTIVE_CR_PROTO_V2;
+        req.proto_version = gpu_cr::kSelectiveCrProtoV2;
         if (dest_path) {
             struct stat st;
             if (stat(dest_path, &st) != 0) {
                 fprintf(stderr, "Error: restore source %s: %s\n", dest_path, strerror(errno));
-                exit(EXIT_OP_FAILED);
+                exit(kExitOpFailed);
             }
-            strncpy(req.dest_path, dest_path, SELECTIVE_CR_MAX_PATH - 1);
+            strncpy(req.dest_path, dest_path, gpu_cr::kSelectiveCrMaxPath - 1);
         }
         comm->control->selective_req = req;
         comm->send_msg(SELECTIVE_RESTORE_MSG);
         kill(pid, CR_RESTORE_SIGNAL);
         printf("Selective restore signal sent.\n");
-        if (!wait_finished(comm)) exit(EXIT_TIMEOUT);
-        check_selective_result(comm, dest_path);
+        if (!WaitFinished(comm)) exit(kExitTimeout);
+        CheckSelectiveResult(comm, dest_path);
         printf("Selective restore done\n");
     } else if(ckpt) {
         comm->send_msg(CKPT_MSG);
         kill(pid, CR_CKPT_SIGNAL);
         printf("Dump signal sent.\n");
-        if (!wait_finished(comm)) exit(EXIT_TIMEOUT);
-        check_full_result(comm, "checkpoint");
+        if (!WaitFinished(comm)) exit(kExitTimeout);
+        CheckFullResult(comm, "checkpoint");
         printf("Dumping done.\n");
 #ifdef __HIP_PLATFORM_AMD__
         // For AMD: call CRIU to dump the process
@@ -517,7 +485,7 @@ int main(int argc, char* argv[]) {
         comm->send_msg(RESTORE_MSG);
         kill(pid, CR_RESTORE_SIGNAL);
 
-        if (!wait_finished(comm)) exit(EXIT_TIMEOUT);
+        if (!WaitFinished(comm)) exit(kExitTimeout);
         auto t2 = std::chrono::high_resolution_clock::now();
         printf("GPUos restore time: %.3f s\n", std::chrono::duration<double>(t2 - t1).count());
 
@@ -526,8 +494,8 @@ int main(int argc, char* argv[]) {
 #else
         comm->send_msg(RESTORE_MSG);
         kill(pid, CR_RESTORE_SIGNAL);
-        if (!wait_finished(comm)) exit(EXIT_TIMEOUT);
-        check_full_result(comm, "restore");
+        if (!WaitFinished(comm)) exit(kExitTimeout);
+        CheckFullResult(comm, "restore");
         std::string bin_path = get_cuda_checkpoint_path();
         std::string cmd = bin_path + " --toggle --pid " + std::to_string(pid);
         auto t0 = std::chrono::high_resolution_clock::now();

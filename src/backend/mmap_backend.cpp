@@ -62,7 +62,7 @@ void* ShareMem::map_dump_buffer(bool fatal) {
         // here (KEP-0002 amendment; GEP-0006 posture at full size — the
         // dump extent grows toward the configured size, so a partial
         // fallocate would only move the fault).
-        int rc = posix_fallocate(fd, 0, (off_t)size);
+        int rc = posix_fallocate(fd, 0, static_cast<off_t>(size));
         if (rc != 0) {
             fprintf(stderr, "[ShareMem] posix_fallocate(%s, %zu MiB): %s\n", shm_name, size >> 20, strerror(rc));
             close(fd);
@@ -71,7 +71,7 @@ void* ShareMem::map_dump_buffer(bool fatal) {
         }
     }
 
-    void* buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void* buf = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (buf == MAP_FAILED) {
         fprintf(stderr, "%s failed: %s\n",
@@ -85,7 +85,7 @@ void* ShareMem::map_dump_buffer(bool fatal) {
     if (!use_file_backend)
         fprintf(stderr, "Hugepage shared memory mapped at %p (%zu MiB)\n", buf, size >> 20);
 
-    shared_mem_fs* fs = (shared_mem_fs*)buf;
+    shared_mem_fs* fs = static_cast<shared_mem_fs*>(buf);
     fs->file_num = 0;
     fs->current_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
     return buf;
@@ -99,9 +99,9 @@ void ShareMem::setup() {
     // tmp_buf. KEP-0002 deferred mode (GPU_CR_SHM_*=0): skip the dump
     // buffer entirely — -o-only deployments never need it; a buffer-path
     // op materializes it at the 64MiB floor via get_tmp_buf().
-    if (gpu_cr_config().shm_deferred) {
+    if (gpu_cr::Config().shm_deferred) {
         fprintf(stderr, "[ShareMem] dump buffer DEFERRED (GPU_CR_SHM=0): created on first buffer-path op at %zu MiB\n",
-                (size_t)(SHM_SIZE >> 20));
+                static_cast<size_t>(SHM_SIZE >> 20));
     } else {
         fs_mutex.lock();
         tmp_buf = map_dump_buffer(/*fatal=*/true);
@@ -142,7 +142,7 @@ void* ShareMem::get_tmp_buf() {
     // creates the buffer at the floor size. Non-fatal: callers must
     // null-check and fail the op cleanly (op_status) — this runs in
     // signal-handler context and must not kill the workload on ENOMEM.
-    if (tmp_buf == nullptr && gpu_cr_config().shm_deferred) {
+    if (tmp_buf == nullptr && gpu_cr::Config().shm_deferred) {
         fs_mutex.lock();
         if (tmp_buf == nullptr)
             tmp_buf = map_dump_buffer(/*fatal=*/false);
