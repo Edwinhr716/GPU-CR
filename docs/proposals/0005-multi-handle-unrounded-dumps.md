@@ -204,3 +204,21 @@ is in CI.
   registration silently falls back to unpinned on failure, which is
   exactly the latent condition that armed the 2026-08-06 crash. §3
   chunking removes the dependence on both.
+- 2026-08-18 — driver bisect (revises the 08-13 conclusion). GKE no
+  longer serves old drivers (the COS driver catalog is updated in place;
+  LATEST and DEFAULT both resolve to 580.159.04 today even on the
+  incident node image), so candidates were installed via a
+  `gpu-driver-version=disabled` pool plus a version-pinned
+  `cos-gpu-installer` DaemonSet. Results: 580.126.20 (the strongest
+  2026-08-06 LATEST candidate; the e2e runbook proves the incident pool
+  used `gpu-driver-version=latest`, ruling out the R535 DEFAULT) is
+  CLEAN — 32/32 copy matrix, hostRegister(hugetlbfs) rc=0 — and
+  registration is not size-dependent (8MB→16GB all succeed). Revised
+  conclusion: the crash is irreproducible in isolation under every
+  reconstructable combination; the unreconstructable residue is the
+  exact driver binary served on 2026-08-06 (the catalog names nothing
+  older than 580.126.20 for the L4 today) and the crashing process's
+  live state (~1,500 fragmented VMM mappings, near-full VRAM). This
+  strengthens rather than weakens §3: the constraint was environmental
+  and post-hoc undiagnosable, precisely the dependency class the chunked
+  copy shape removes.
