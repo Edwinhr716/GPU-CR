@@ -79,11 +79,37 @@ std::string get_cuda_checkpoint_path() {
 
     if (access(full_path.c_str(), X_OK) != 0) {
         fprintf(stderr, "WARNING: helper binary not found at: %s\n", full_path.c_str());
-        return "cuda-checkpoint"; 
+        return "cuda-checkpoint";
     }
 
     return full_path;
 }
+
+namespace {
+
+// Runs "<bin> --toggle --pid <pid>" without a shell: cr_client ships in
+// distroless agent images where system() has no /bin/sh and always fails
+// with 127. execlp keeps the PATH lookup for a bare "cuda-checkpoint".
+// Returns the command's exit status (127 if it could not be executed,
+// 128+signal if it died on one), or -1 if it could not be spawned/reaped —
+// mirroring system()'s <0 / status split the callers already handle.
+int RunCudaCheckpointToggle(const std::string& bin_path, pid_t target_pid) {
+    std::string pid_str = std::to_string(target_pid);
+    pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        execlp(bin_path.c_str(), bin_path.c_str(), "--toggle", "--pid",
+               pid_str.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return -1;
+}
+
+}  // namespace
 
 
 namespace {
@@ -446,13 +472,11 @@ int main(int argc, char* argv[]) {
         printf("CRIU checkpoint time: %.3f s\n", std::chrono::duration<double>(t1 - t0).count());
 #else
         std::string bin_path = get_cuda_checkpoint_path();
-        std::string cmd = bin_path + " --toggle --pid " + std::to_string(pid);
-        // std::string cmd = "cuda-checkpoint --toggle --pid " + std::to_string(pid);
         auto t0 = std::chrono::high_resolution_clock::now();
         if (!buffer_only)
-            ret = system(cmd.c_str());
+            ret = RunCudaCheckpointToggle(bin_path, pid);
         if (ret < 0) {
-            perror("system()");
+            perror("toggle spawn");
             exit(EXIT_FAILURE);
         }
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -503,18 +527,18 @@ int main(int argc, char* argv[]) {
         if (!WaitFinished(comm)) exit(kExitTimeout);
         CheckFullResult(comm, "restore");
         std::string bin_path = get_cuda_checkpoint_path();
-        std::string cmd = bin_path + " --toggle --pid " + std::to_string(pid);
         auto t0 = std::chrono::high_resolution_clock::now();
         if (!buffer_only)
-            ret = system(cmd.c_str());
+            ret = RunCudaCheckpointToggle(bin_path, pid);
         if (ret < 0) {
-            perror("system()");
+            perror("toggle spawn");
             exit(EXIT_FAILURE);
         }
         // A failed toggle leaves the process frozen with its VRAM already
         // rewritten — surface it, never report success.
         if (ret != 0) {
-            fprintf(stderr, "Error: '%s' exited with status %d\n", cmd.c_str(), ret);
+            fprintf(stderr, "Error: '%s --toggle --pid %d' exited with status %d\n",
+                    bin_path.c_str(), pid, ret);
             exit(kExitOpFailed);
         }
         auto t1 = std::chrono::high_resolution_clock::now();
