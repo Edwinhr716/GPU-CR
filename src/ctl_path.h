@@ -1,7 +1,7 @@
 #ifndef GPU_CR_SRC_CTL_PATH_H_
 #define GPU_CR_SRC_CTL_PATH_H_
 
-// GEP-0006: the control plane (control-<pid>, ctl-ready-<pid>, pid_map_*,
+// The control plane (control-<pid>, ctl-ready-<pid>, pid_map_*,
 // the id counter) moves off hugetlbfs onto a caller-provided tmpfs, so no
 // hugetlb page is ever faulted from the coordinating process's cgroup.
 // Dump/staging DATA files stay in EXPORT_FILE_PATH untouched.
@@ -27,13 +27,13 @@ namespace gpu_cr {
 inline constexpr unsigned long kTmpfsMagic = 0x01021994UL;
 
 // Control-channel protocol level advertised by the .so and required by
-// cr_client. Proto >= 3 implies GEP-0006 advertisements and GEP-0001
+// cr_client. Proto >= 3 implies readiness advertisements and
 // destination-path support.
 inline constexpr int kCtlProto = 3;
 
 constexpr size_t RoundUp4K(size_t x) { return (x + 4095UL) & ~4095UL; }
 
-// Directory holding dump/staging DATA files (unchanged by GEP-0006).
+// Directory holding dump/staging DATA files (unchanged by the ctl split).
 inline const char* DataDir() {
   const char* dir = getenv("EXPORT_FILE_PATH");
   return (dir && dir[0]) ? dir : "/mnt/huge-ckpt";
@@ -103,9 +103,9 @@ inline long long ProcStarttime(pid_t pid) {
   return ParseStarttimeFromStat(buf);
 }
 
-// Readiness advertisement written by the .so at load (GEP-0006) and read
-// back by cr_client before it signals. KEP-0002 appended the buffer-sizing
-// keys so the agent can observe workload sizing.
+// Readiness advertisement written by the .so at load and read back by
+// cr_client before it signals; carries the buffer-sizing keys so the
+// agent can observe workload sizing.
 struct Advertisement {
   int proto = 0;
   long long starttime = -1;
@@ -121,8 +121,8 @@ inline bool ParseAdvertisement(const char* line, Advertisement* out) {
                 &out->starttime, out->ctl) >= 1;
 }
 
-// Writes the ctl-ready-<pid> advertisement (GEP-0006), including the
-// KEP-0002 buffer-sizing keys so the agent can observe workload sizing.
+// Writes the ctl-ready-<pid> advertisement, including the buffer-sizing
+// keys so the agent can observe workload sizing.
 // Called from the .so's constructor — failures are reported, never fatal:
 // this must not take down the workload. Returns false on write failure.
 inline bool WriteAdvertisement(const char* ctl_dir, pid_t pid, size_t shm_mb,

@@ -1,4 +1,4 @@
-// GEP-0001 destination-dump layout validation (header plausibility and
+// Destination-dump layout validation (header plausibility and
 // commit marker) against crafted files — no GPU required.
 
 #include "dump_format.h"

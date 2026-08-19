@@ -183,7 +183,7 @@ static void* open_worker_shm(int cr_id) {
     // Map only the header window: the IPC scratch blocks (get_my_block /
     // get_peer_block) live inside ROUND_UP_2MB(sizeof(shared_mem_fs)), and
     // mapping the worker's full buffer at OUR compile-time SHM_SIZE was the
-    // one real cross-binary size coupling (KEP-0002 F2) — an env-sized
+    // one real cross-binary size coupling — an env-sized
     // worker file plus a larger mapping here reserves the whole range on
     // hugetlbfs (ENOMEM on right-sized pools) or SIGBUSes past EOF.
     void* ptr = mmap(nullptr, ROUND_UP_2MB(sizeof(shared_mem_fs)), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

@@ -1,4 +1,4 @@
-// KEP-0002 unit matrix: env parsing, bounds, defaults, legacy warnings.
+// Buffer-config unit matrix: env parsing, bounds, defaults, legacy warnings.
 // Host-only (no CUDA); exercises gpu_cr::internal::Load() directly so each
 // case gets a fresh parse (the production singleton caches, by design).
 

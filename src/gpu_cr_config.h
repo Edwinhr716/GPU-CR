@@ -1,7 +1,7 @@
 #ifndef GPU_CR_SRC_GPU_CR_CONFIG_H_
 #define GPU_CR_SRC_GPU_CR_CONFIG_H_
 
-// KEP-0002: runtime-sizable checkpoint buffers.
+// Runtime-sizable checkpoint buffers.
 //
 // Buffer sizes come from the environment, read once and cached; the
 // compile-time macros (SHM_SIZE_GB build arg, 1GiB staging) are the
@@ -23,7 +23,7 @@
 // never a silent clamp.
 //
 // This is a function-local-static singleton, NOT a second ELF
-// constructor: cross-TU constructor order vs the GEP-0006 init() is
+// constructor: cross-TU constructor order vs init() is
 // unspecified, so init() invokes gpu_cr::Config() as its first statement
 // and the signal handlers only ever consume cached values.
 
@@ -63,7 +63,7 @@ inline BufConfig Load(size_t shm_default, size_t staging_default) {
 
   // Legacy names were shipped in manifests for years but never read by
   // any code; honoring them retroactively would break working
-  // deployments (KEP-0002 Drawback 3), so they warn instead.
+  // deployments, so they warn instead.
   if (getenv("GPUCR_SHM_GB") || getenv("GPUCR_STAGING_MB")) {
     fprintf(stderr,
             "[gpu-cr-config] WARNING: GPUCR_SHM_GB/GPUCR_STAGING_MB were "

@@ -35,7 +35,7 @@ void* ShareMem::map_dump_buffer(bool fatal) {
     char shm_name[512];
     const char* export_file_path = std::getenv("EXPORT_FILE_PATH");
     bool use_file_backend = (export_file_path != nullptr);
-    size_t size = SHM_SIZE; // runtime config (KEP-0002)
+    size_t size = SHM_SIZE; // runtime config
 
     if (use_file_backend) {
         snprintf(shm_name, sizeof(shm_name), "%s/ckpt-%d.data", export_file_path, id);
@@ -59,7 +59,7 @@ void* ShareMem::map_dump_buffer(bool fatal) {
     if (use_file_backend) {
         // tmpfs/disk reserve nothing at ftruncate or mmap; without this a
         // full store is a SIGBUS mid-dump instead of a synchronous ENOSPC
-        // here (KEP-0002 amendment; GEP-0006 posture at full size — the
+        // here (a deliberate posture — the
         // dump extent grows toward the configured size, so a partial
         // fallocate would only move the fault).
         int rc = posix_fallocate(fd, 0, static_cast<off_t>(size));
@@ -96,7 +96,7 @@ void ShareMem::setup() {
     const char* export_file_path = std::getenv("EXPORT_FILE_PATH");
     bool use_file_backend = (export_file_path != nullptr);
 
-    // tmp_buf. KEP-0002 deferred mode (GPU_CR_SHM_*=0): skip the dump
+    // tmp_buf. Deferred mode (GPU_CR_SHM_*=0): skip the dump
     // buffer entirely — -o-only deployments never need it; a buffer-path
     // op materializes it at the 64MiB floor via get_tmp_buf().
     if (gpu_cr::Config().shm_deferred) {
@@ -137,7 +137,7 @@ void ShareMem::setup() {
 }
 
 void* ShareMem::get_tmp_buf() {
-    // Deferred-mode lazy materialization (KEP-0002): first buffer-path op
+    // Deferred-mode lazy materialization: first buffer-path op
     // (legacy dump/restore, full C/R, or an IPC verb's scratch blocks)
     // creates the buffer at the floor size. Non-fatal: callers must
     // null-check and fail the op cleanly (op_status) — this runs in

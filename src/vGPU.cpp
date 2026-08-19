@@ -49,13 +49,13 @@ void* staging_buf[STAGING_BUF_NUM];
 bool CR_initialized = false;
 
 // errno-style op status; copied into control->op_status at FINISH so v2
-// clients can distinguish clean failures from success (GEP-0001/KEP-0002).
+// clients can distinguish clean failures from success.
 int g_op_status = 0;
 
 // memcpy_multi lives in src/memcpy_multi.cpp (declared in common.h) so the
 // GPU-free unit suite can link it.
 
-// Pointer-typed convenience wrapper over the GEP-0005 §3 clamp (the math
+// Pointer-typed convenience wrapper over the granule clamp (the math
 // lives in common.h as gpu_cr::GranuleClampLen so it is unit-testable).
 static inline size_t GranuleClamp(const void* dev_ptr, size_t len) {
     return gpu_cr::GranuleClampLen(reinterpret_cast<uintptr_t>(dev_ptr), len);
@@ -87,7 +87,7 @@ double ckpt() {
     fs_mutex.lock();
     std::lock_guard<std::mutex> lock(gpu_mem_mutex);
 
-    // KEP-0002: with env-shrinkable buffers an oversized full checkpoint
+    // With env-shrinkable buffers an oversized full checkpoint
     // is an operator-config away, so validate BEFORE touching fs or GPU
     // state — nothing dumped, nothing released, clean op_status failure
     // instead of the historical mid-loop exit(-1).
@@ -258,7 +258,7 @@ static bool FindContainingAllocation(void* ptr, void** base_ptr, size_t* alloc_s
 }
 
 // ---------------------------------------------------------------------------
-// GEP-0001: destination-path selective checkpoints.
+// Destination-path selective checkpoints.
 // A caller-chosen file replaces the per-PID staging buffer for one op.
 // The caller pre-creates the file (O_CREAT only); sizing is done HERE,
 // because only the .so knows the containing-allocation totals. All
@@ -286,7 +286,7 @@ static void DestClose(DestMap* dm) {
 
 static bool DestOpenCommon(const char* path, int prot, DestMap* dm) {
     // Never O_CREAT: existence is the caller's responsibility, and creating
-    // here would let a stale dest_path materialize files (GEP-0001 F2).
+    // here would let a stale dest_path materialize files.
     dm->fd = open(path, (prot & PROT_WRITE) ? O_RDWR : O_RDONLY);
     if (dm->fd < 0) {
         g_op_status = errno;
@@ -333,7 +333,7 @@ static bool DestOpenForCkpt(const char* path, size_t total, DestMap* dm) {
 }
 
 // Restore side: refuse anything without a valid header and commit marker —
-// a torn dump must fail the op, not feed garbage to the GPU (GEP-0001 F7).
+// a torn dump must fail the op, not feed garbage to the GPU.
 static bool DestOpenForRestore(const char* path, DestMap* dm) {
     if (!DestOpenCommon(path, PROT_READ, dm)) return false;
     struct stat st;
@@ -401,7 +401,7 @@ double ckpt_selective(const SelectiveCrRequest* req) {
 
     // Resolve target blocks BEFORE picking the output: with a destination
     // file the exact dump size must be known up front (only the .so knows
-    // the containing-allocation totals — GEP-0001 preloader-authoritative
+    // the containing-allocation totals — preloader-authoritative
     // sizing). Both mutexes are held, so the sizes cannot shift under us.
     std::set<void*> blocks_to_snapshot;
     for (uint32_t ri = 0; ri < req->num_regions; ri++) {
@@ -439,7 +439,7 @@ double ckpt_selective(const SelectiveCrRequest* req) {
             return -1;
         }
         fs_capacity = SHM_SIZE;
-        // KEP-0002: the legacy buffer is env-shrinkable now — same clean
+        // The legacy buffer is env-shrinkable now — same clean
         // pre-op failure as the dest path instead of the historical
         // mid-loop exit(-1).
         if (dump_total > fs_capacity) {
@@ -535,7 +535,7 @@ double ckpt_selective(const SelectiveCrRequest* req) {
         void* d = base_ptr;
         while (size > 0) {
             size_t cur_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
-            cur_size = GranuleClamp(d, cur_size);  // GEP-0005 §3
+            cur_size = GranuleClamp(d, cur_size);  // granule-boundary clamp
             void* start_addr = static_cast<char*>(staging_buf[current_buf & 1]) + buf_offset;
 
             if (gpu->memcpyAsync(start_addr, d, cur_size, GPUMemcpyKind::DeviceToHost, stream) != 0) {
@@ -783,7 +783,7 @@ double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
     if (dest_path) {
         if (!DestOpenForRestore(dest_path, &dm)) return -1;
         fs = static_cast<shared_mem_fs*>(dm.addr);
-        // Cross-check the request against the dump (GEP-0001 F7): every
+        // Cross-check the request against the dump: every
         // requested region must resolve to a live allocation whose base is
         // one of the dump's files — the header is otherwise trusted input
         // from a caller-writable directory.
@@ -886,7 +886,7 @@ double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
 
         while (size > 0) {
             size_t this_copy_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
-            this_copy_size = GranuleClamp(requested_addr, this_copy_size);  // GEP-0005 §3
+            this_copy_size = GranuleClamp(requested_addr, this_copy_size);  // granule-boundary clamp
             assert(buf_offset == offset - src_offset);
 
             if (gpu->memcpyAsync(requested_addr, static_cast<char*>(staging_buf[current_buf & 1]) + (offset - src_offset),
@@ -1026,7 +1026,7 @@ void init_CR() {
 
     comm = new ShareMemComm(getpid());
     comm->setup();
-    // Publish dest-path capability (GEP-0001). Persistent across ops: the
+    // Publish dest-path capability. Persistent across ops: the
     // consume-once zeroing at FINISH deliberately leaves this word alone.
     (static_cast<ShareMemComm*>(comm))->control->capability |= gpu_cr::kCrCapDestPath;
     backend = new ShareMem(id);
@@ -1058,7 +1058,7 @@ void init_CR() {
     fprintf(stderr, "[init_CR] Initialization complete, setting CR_initialized = true\n");
 }
 
-// Post-op bookkeeping (GEP-0001, extended to full ops by KEP-0002): report
+// Post-op bookkeeping: report
 // status + proto ack, then consume the v2 request extension so a stale
 // dest_path can never redirect a later op (a v1 cr_client only rewrites
 // the v1 prefix). v2 clients gate cuda-checkpoint --toggle on op_status —
@@ -1142,7 +1142,7 @@ void cr_signal_handler(int signum) {
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         if (tot_size < 0) {
-            // KEP-0002 clean failure: nothing dumped, nothing released —
+            // Clean pre-op failure: nothing dumped, nothing released —
             // the workload keeps running. P2P must NOT be disabled and a
             // v2 cr_client must NOT proceed to cuda-checkpoint --toggle.
             fprintf(stderr, "ckpt FAILED, status=%d (%s)\n", g_op_status, strerror(g_op_status));
@@ -1364,7 +1364,7 @@ void cr_ipc_signal_handler(int signum) {
 
         // Write export info to shared memory for peers to read.
         // Deferred mode: this materializes the buffer at the floor size
-        // (IPC verbs are buffer-path ops — KEP-0002 NEW-1).
+        // (IPC verbs are buffer-path ops).
         auto t_shm = std::chrono::high_resolution_clock::now();
         void* tmp_buf = backend->get_tmp_buf();
         if (!tmp_buf) {
@@ -1459,7 +1459,7 @@ void cr_ipc_signal_handler(int signum) {
 // Library constructor: register all signal handlers
 // ---------------------------------------------------------------------------
 __attribute__((constructor)) void init() {
-    // KEP-0002: resolve buffer config FIRST — a function-local-static
+    // Resolve buffer config FIRST — a function-local-static
     // singleton invoked here (not a second ELF constructor, whose order vs
     // this one would be unspecified). Signal handlers only read the cache.
     const gpu_cr::BufConfig& buf_cfg = gpu_cr::Config();
@@ -1473,7 +1473,7 @@ __attribute__((constructor)) void init() {
     signal(CR_CKPT_SIGNAL, cr_signal_handler);
     signal(CR_RESTORE_SIGNAL, cr_signal_handler);
 
-    // GEP-0006 readiness advertisement: written HERE, in the same
+    // Readiness advertisement: written HERE, in the same
     // constructor that installs the handlers, so its existence proves the
     // signals above are safe to send — cr_client refuses to kill() without
     // it. starttime makes the file self-invalidating across PID reuse.
@@ -1484,7 +1484,7 @@ __attribute__((constructor)) void init() {
         bool ctl_mode = false;
         const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
         if (ctl_mode) {
-            // shm_mb/staging_mb/deferred: additive keys (KEP-0002) so the
+            // shm_mb/staging_mb/deferred: additive keys so the
             // agent can OBSERVE workload buffer sizing and cross-check it
             // against pod hugepage requests — closing the observability
             // corner of the three-way consistency triangle.

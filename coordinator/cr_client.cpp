@@ -14,7 +14,7 @@
 #include <string.h>
 #include <string>
 
-// openat2 hardening for the pre-create (GEP-0001 F8): cr_client runs as
+// openat2 hardening for the pre-create: cr_client runs as
 // root in the agent pod against a workload-writable store, so symlink
 // swaps must not let it create/truncate arbitrary host files. Definitions
 // are local so old kernel headers still build; ENOSYS falls back to
@@ -115,7 +115,7 @@ int RunCudaCheckpointToggle(const std::string& bin_path, pid_t target_pid) {
 namespace {
 
 // Pre-creates the destination file: existence only (O_CREAT), never sizing —
-// the .so alone can compute the dump total (GEP-0001 preloader-authoritative
+// the .so alone can compute the dump total (preloader-authoritative
 // sizing), and an inode costs no hugepages/blocks in this cgroup.
 bool SecurePrecreate(const char* path) {
     if (path[0] != '/') {
@@ -156,7 +156,7 @@ bool SecurePrecreate(const char* path) {
     return true;
 }
 
-// Post-checkpoint validation of a destination dump (GEP-0001 F1): header
+// Post-checkpoint validation of a destination dump: header
 // plausibility + trailing commit marker, via read(2) — no mmap, so no
 // hugetlb reservation or fault lands in this process's cgroup.
 bool ValidateDestDump(const char* path) {
@@ -172,7 +172,7 @@ bool ValidateDestDump(const char* path) {
     return ok;
 }
 
-// GEP-0006 pre-signal gate: refuse to kill() unless the target's .so wrote
+// Pre-signal gate: refuse to kill() unless the target's .so wrote
 // a readiness advertisement into OUR ctl dir. Presence in this dir proves
 // shared backing (the only way the file got here); proto proves the
 // library level; starttime kills the PID-reuse case, where the signal
@@ -184,7 +184,7 @@ bool CheckAdvertisement(const char* ctl_dir, int pid) {
     FILE* f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "Error: no readiness advertisement at %s — vGPU.so not loaded in PID %d, "
-                        "GPU_CR_CTL_PATH mismatch, or pre-GEP-0006 library\n", path, pid);
+                        "GPU_CR_CTL_PATH mismatch, or a library without ctl support\n", path, pid);
         return false;
     }
     char buf[600] = "";
@@ -233,7 +233,7 @@ bool WaitFinished(ShareMemComm* comm) {
     return true;
 }
 
-// After a FULL ckpt/restore: a v2 .so reports op_status (KEP-0002 clean
+// After a FULL ckpt/restore: a v2 .so reports op_status (clean
 // failures: oversized checkpoint, deferred-buffer ENOMEM). On checkpoint
 // failure we must NOT proceed to cuda-checkpoint --toggle — freezing a
 // process whose state was never saved is unrecoverable; on restore
@@ -330,7 +330,7 @@ int main(int argc, char* argv[]) {
     assert(pid != 0);
     if (criu_pid == 0) criu_pid = pid;
 
-    // GEP-0006: a configured-but-broken ctl path is refused HERE, loudly.
+    // A configured-but-broken ctl path is refused HERE, loudly.
     // (The .so falls back to legacy instead — it must not die — so the
     // coordinator is where the misconfiguration surfaces.)
     bool ctl_mode = false;
@@ -342,18 +342,18 @@ int main(int argc, char* argv[]) {
         exit(kExitRefused);
     }
 
-    // Pre-signal gate (GEP-0006): never kill() a PID whose .so hasn't
+    // Pre-signal gate: never kill() a PID whose .so hasn't
     // advertised readiness in our ctl dir — covers not-loaded, env
-    // mismatch, pre-GEP libraries and PID reuse in one check.
+    // mismatch, older libraries and PID reuse in one check.
     if (ctl_mode && !CheckAdvertisement(ctl_dir, pid))
         exit(kExitRefused);
 
     ShareMemComm *comm = new ShareMemComm(pid);
     comm->setup();
 
-    // Serialize concurrent cr_clients against the same PID for the whole op
-    // (GEP-0001 F2): nothing else orders two writers of selective_req.
-    // Fixed order, legacy lock first (GEP-0006 F4): the legacy file is
+    // Serialize concurrent cr_clients against the same PID for the whole
+    // op: nothing else orders two writers of selective_req.
+    // Fixed order, legacy lock first: the legacy file is
     // taken with open(O_CREAT)+flock only — an inode lock faults no
     // hugetlb pages, so it stays safe with a zero hugepages request.
     if (ctl_mode) {

@@ -8,7 +8,7 @@
 //   FAKE_OP_STATUS   errno-style status to report at FINISH (default 0)
 //   FAKE_SKIP_COMMIT write destination dumps WITHOUT the commit marker
 //   FAKE_NO_FINISH   never send FINISH (drives the cr_client timeout path)
-//   FAKE_V1          behave like a pre-GEP-0001 .so: no capability, no
+//   FAKE_V1          behave like a v1-only .so: no capability, no
 //                    proto_ack/op_status, no consume-once, no dest-path
 //   FAKE_READY_FILE  file created once the control channel is up
 //   FAKE_LOG         per-op log: "op=<msg> dest=<path-or-empty>" lines

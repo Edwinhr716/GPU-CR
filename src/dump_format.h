@@ -1,7 +1,7 @@
 #ifndef GPU_CR_SRC_DUMP_FORMAT_H_
 #define GPU_CR_SRC_DUMP_FORMAT_H_
 
-// Destination-file dump layout helpers (GEP-0001).
+// Destination-file dump layout helpers.
 //
 // A dump is a shared_mem_fs header (2MiB-rounded), the extents, and a
 // trailing DumpCommit marker at current_offset. The marker is written

@@ -20,7 +20,7 @@
 namespace gpu_cr {
 namespace {
 
-// Pin small KEP-0002 buffer sizes (floors: 64MiB dump, 128MiB staging) and
+// Pin small buffer sizes (floors: 64MiB dump, 128MiB staging) and
 // capture them into the cached gpu_cr::Config() singleton at static-init
 // time — gpu_cr_config_test's fixture scrubs these env vars, so waiting
 // until the first test-time Config() call would fall back to the 25GiB

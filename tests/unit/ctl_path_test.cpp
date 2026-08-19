@@ -1,4 +1,4 @@
-// GEP-0006 control-plane path resolution, /proc/<pid>/stat parsing, and
+// Control-plane path resolution, /proc/<pid>/stat parsing, and
 // readiness-advertisement round trip. Linux-only (statfs, /proc).
 
 #include "ctl_path.h"

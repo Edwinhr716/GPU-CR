@@ -1,5 +1,5 @@
-// Shared-protocol helpers from common.h: GEP-0005 granule clamping and the
-// GEP-0001 consume-once FINISH bookkeeping.
+// Shared-protocol helpers from common.h: granule clamping and the
+// consume-once FINISH bookkeeping.
 
 #include "common.h"
 
@@ -33,7 +33,7 @@ TEST(GranuleClampLenTest, UnalignedStartClampsToBoundary) {
 
 TEST(GranuleClampLenTest, EveryClampEndsAlignedOrAtRegionEnd) {
   // Walk a simulated 5MiB+3 region from an unaligned base the way the
-  // selective copy loops do, asserting the GEP-0005 invariant for each
+  // selective copy loops do, asserting the clamp invariant for each
   // issued copy: <=2MB, and granule-aligned at its start or its end
   // (or it is the final copy of the region).
   uintptr_t addr = 12345;
@@ -88,7 +88,7 @@ TEST(FinishOpControlsTest, CapabilityPersistsAcrossOps) {
 }
 
 // Layout guards for the shared-memory wire structs: the v2 fields are
-// appended so the v1 prefix keeps its exact offsets (GEP-0001).
+// appended so the v1 prefix keeps its exact offsets.
 TEST(WireLayoutTest, V1PrefixOffsetsUnchanged) {
   EXPECT_EQ(offsetof(SelectiveCrRequest, num_regions), 0u);
   EXPECT_EQ(offsetof(SelectiveCrRequest, regions), 8u);
