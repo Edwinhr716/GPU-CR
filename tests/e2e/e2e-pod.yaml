@@ -1,5 +1,5 @@
 # One-shot GPU pod running the e2e correctness gates and the perf-regression
-# suite against upstream v0.2.1.
+# suite against upstream GPU-CR (e9bbb52).
 #
 #   1. Build candidate (runs unit+integration suites as a gate):
 #        gcloud builds submit --config cloudbuild-so.yaml --substitutions=_TAG=<tag> .

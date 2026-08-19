@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Performance-regression gate: the consolidated build must not regress the
-# full checkpoint/restore data plane that upstream v0.2.1 (e9bbb52) delivers.
+# full checkpoint/restore data plane that upstream GPU-CR (e9bbb52) delivers.
 #
 # Runs the SAME pattern workload under the baseline .so and the candidate
 # .so on the same node, measures the .so-reported full ckpt()/restore data-

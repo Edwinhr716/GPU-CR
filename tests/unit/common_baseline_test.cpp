@@ -1,4 +1,4 @@
-// Upstream-baseline pieces of common.h (present since v0.2.1): the 2MB
+// Upstream-baseline pieces of common.h (inherited from upstream): the 2MB
 // rounding macro, hugepage geometry, the C/R signal numbers, and the v1
 // control-word prefix that every later extension must leave undisturbed.
 
@@ -40,7 +40,7 @@ TEST(HugePageGeometryTest, GranuleMatchesHugePageSize) {
   EXPECT_EQ(ROUND_UP_2MB(1UL), kVmmGranuleSize);
 }
 
-// The v1 control word must stay at offset 0: a v0.2.1 cr_client and a
+// The v1 control word must stay at offset 0: an upstream cr_client and a
 // current .so share the same zero-initialized mapping.
 TEST(SignalControlsLayoutTest, SignalWordIsFirst) {
   EXPECT_EQ(offsetof(signal_controls, signal), 0u);

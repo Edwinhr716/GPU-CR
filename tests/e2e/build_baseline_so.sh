@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the PERF BASELINE artifacts from upstream v0.2.1 (e9bbb52) — the
+# Builds the PERF BASELINE artifacts from upstream GPU-CR (e9bbb52) — the
 # reference point the perf-regression suite measures against. Applies the
 # same deployment patches the consolidated build carries (signal remap;
 # 0777 was still a build-time patch at e9bbb52) so both variants run in the
