@@ -136,7 +136,9 @@ target_compile_options(multi_cr_client PRIVATE -O3 -g)
 # ---------------------------------------------------------------------------
 # Tests (GPU-free; run in Dockerfile.build and cloudbuild-test.yaml)
 #   gpu_cr_unit_tests        — GoogleTest unit suite for the config, ctl-path,
-#                              dump-format, granule-clamp and region-spec code
+#                              dump-format, granule-clamp and region-spec code,
+#                              plus the upstream-baseline control channel,
+#                              buffer mapping, fd exchange and memcpy_multi
 #   fake_workload            — GPU-free stand-in for the vGPU.so side of the
 #                              control channel
 #   cr_client_integration    — drives the real cr_client binary against
@@ -157,17 +159,28 @@ if(GPU_CR_BUILD_TESTS)
     enable_testing()
 
     add_executable(gpu_cr_unit_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/common_baseline_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/common_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ctl_path_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/dump_format_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/gpu_cr_config_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ipc_fd_exchange_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/memcpy_multi_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/mmap_backend_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/selective_spec_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/share_mem_comm_test.cpp
+        # GPU-free production sources under test (upstream-baseline functions)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mmap_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/comm/share_mem.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_fd_exchange.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/memcpy_multi.cpp
     )
     target_include_directories(gpu_cr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/coordinator
     )
-    target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main)
+    target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)
     add_test(NAME unit COMMAND gpu_cr_unit_tests)
 
     add_executable(fake_workload

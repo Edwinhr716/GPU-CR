@@ -6,11 +6,21 @@ The first two run automatically inside every `Dockerfile.build` image build
 
 ## 1. Unit tests — `tests/unit/` (GoogleTest, no GPU, Linux)
 
-Function-level coverage of the code added on top of upstream v0.2.1:
-buffer-size config parsing (KEP-0002), control-path resolution and
-advertisement round-trip (GEP-0006), dump-format validation (GEP-0001),
-granule clamping (GEP-0005), consume-once FINISH bookkeeping, region-spec
-parsing, and wire-layout guards.
+Function-level coverage of two layers:
+
+- **Code added on top of upstream v0.2.1**: buffer-size config parsing
+  (KEP-0002), control-path resolution and advertisement round-trip
+  (GEP-0006), dump-format validation (GEP-0001), granule clamping
+  (GEP-0005), consume-once FINISH bookkeeping, region-spec parsing, and
+  wire-layout guards.
+- **The upstream-baseline functions themselves**: the 2MB rounding macro,
+  signal numbers and wire structs (`common_baseline_test`), the
+  ShareMemComm control channel (`share_mem_comm_test`), the ShareMem
+  dump/staging buffer mapping via the file backend (`mmap_backend_test`),
+  the UDS SCM_RIGHTS fd exchange (`ipc_fd_exchange_test`), and
+  `memcpy_multi` (`memcpy_multi_test`). `createGPU()` and the CUDA/HIP
+  hook layers need a driver link, so they stay covered by the
+  integration and e2e tiers.
 
 ```sh
 cmake -DGPU_VENDOR=NVIDIA -DGPU_CR_BUILD_TESTS=ON .. && make && ctest -R unit

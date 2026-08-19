@@ -52,22 +52,8 @@ bool CR_initialized = false;
 // clients can distinguish clean failures from success (GEP-0001/KEP-0002).
 int g_op_status = 0;
 
-// Helper function: multi-threaded memcpy
-void memcpy_multi(void* dest, void* src, size_t size) {
-    std::vector<std::thread> threads;
-    size_t chunk_size = (size + NUM_COPY_THREADS - 1) / NUM_COPY_THREADS;
-    for (int i = 0; i < NUM_COPY_THREADS; i++) {
-        size_t offset = i * chunk_size;
-        if (offset >= size) break;
-        size_t this_chunk_size = std::min(chunk_size, size - offset);
-        threads.emplace_back([=]() {
-            memcpy((char*)dest + offset, (char*)src + offset, this_chunk_size);
-        });
-    }
-    for (auto& t : threads) {
-        t.join();
-    }
-}
+// memcpy_multi lives in src/memcpy_multi.cpp (declared in common.h) so the
+// GPU-free unit suite can link it.
 
 // Pointer-typed convenience wrapper over the GEP-0005 §3 clamp (the math
 // lives in common.h as gpu_cr::GranuleClampLen so it is unit-testable).
