@@ -51,7 +51,7 @@ measure() {
     local label=$1 so=$2 client=$3
     shift 3
     : > "$RUN/workload.stderr"
-    # Baseline (pre-KEP-0002) has no env sizing: its dump buffer is the
+    # The baseline .so has no env-based sizing: its dump buffer is the
     # compile-time SHM_SIZE_GB, which the caller must have built large
     # enough. The candidate takes GPU_CR_SHM_MB (a no-op for the baseline).
     start_workload "$so" \
@@ -77,8 +77,9 @@ measure() {
 
 echo "perf regression: ${NUM_BUFFERS}x${BUFFER_MB}MiB buffers, $ITERS iters, threshold ${THRESHOLD_PCT}%"
 
-# Perf tests run in the legacy (no-ctl) layout: e9bbb52 predates GEP-0006
-# and both variants must see identical plumbing.
+# Perf tests run in the legacy (no-ctl) layout: the e9bbb52 baseline
+# predates the ctl-path control plane and both variants must see identical
+# plumbing.
 unset GPU_CR_CTL_PATH
 
 BASE=$(measure baseline "$BASELINE_SO" "$BASELINE_CLIENT") || exit 1

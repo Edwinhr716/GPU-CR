@@ -1,17 +1,18 @@
 # One-shot GPU pod running the e2e correctness gates and the perf-regression
 # suite against upstream GPU-CR (e9bbb52).
 #
-#   1. Build candidate (runs unit+integration suites as a gate):
-#        gcloud builds submit --config cloudbuild-so.yaml --substitutions=_TAG=<tag> .
+#   1. Build the candidate e2e image (the GPU-free suites run as a build gate)
+#      and push it to a registry your cluster can pull from:
+#        docker build -f Dockerfile.build --target e2e -t <registry>/gpucr-e2e:<tag> .
 #   2. Build baseline once: tests/e2e/build_baseline_so.sh
 #   3. Point the images below at your registry, then:
 #        kubectl apply -f tests/e2e/e2e-pod.yaml
 #        kubectl logs -f gpu-cr-e2e
 #      Pod exits 0 only if every e2e gate AND the perf gate pass.
 #
-# Requires a node with 1 GPU and 2Mi hugepages provisioned (any pool the
-# E1-E16 experiments ran on). PERF_* sizing below fits a 16GiB-hugepage pool;
-# scale up on bigger pools for steadier bandwidth numbers.
+# Expects a pre-existing Kubernetes cluster with a node exposing 1 GPU and
+# 2Mi hugepages. PERF_* sizing below fits a node with 16GiB of 2Mi
+# hugepages; scale up on bigger nodes for steadier bandwidth numbers.
 apiVersion: v1
 kind: Pod
 metadata:

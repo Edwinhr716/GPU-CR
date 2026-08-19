@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end test for the consolidated GPU-CR stack on a GPU node.
 #
-# Drives a real CUDA workload under LD_PRELOAD through the checkpoint/
-# restore surface the E1-E16 experiments used, gating on byte-identical
-# GPU memory after every restore:
+# Drives a real CUDA workload under LD_PRELOAD through the full
+# checkpoint/restore surface, gating on byte-identical GPU memory after
+# every restore:
 #   G1  baseline pattern verify
 #   G2  destination-path selective checkpoint (-o) succeeds
 #   G3  destination-path selective restore succeeds

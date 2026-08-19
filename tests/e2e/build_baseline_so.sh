@@ -8,7 +8,7 @@
 # Usage: build_baseline_so.sh [git-ref] [image-tag] [shm-size-gb]
 # Produces asia-southeast1-docker.pkg.dev/$PROJECT/time-slicing/gpucr-so:<tag>
 #
-# shm-size-gb defaults to 5: the baseline has no KEP-0002 env sizing, so its
+# shm-size-gb defaults to 5: the baseline has no env-based sizing, so its
 # compile-time dump buffer must fit the perf pod's hugepage request while
 # still covering the perf workload (PERF_NUM_BUFFERS x PERF_BUFFER_MB).
 set -eu

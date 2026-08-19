@@ -7,6 +7,29 @@ on — <https://github.com/gpu-os/GPU-CR/tree/main> — pinned at commit
 `Dockerfile.build` image build (`RUN_TESTS=1`, the default) — a red suite
 fails the build.
 
+## What you need
+
+- **GPU-free tiers (unit + integration) — no GPU, no cloud, no
+  cluster.** Any Linux machine with
+  CMake and a C++ compiler works; GoogleTest downloads at configure time,
+  so network access is the only external dependency. `docker build -f
+  Dockerfile.build .` runs the same suite hermetically if you'd rather
+  not install a toolchain.
+- **Google Cloud Build is not required.** Every image is a plain
+  `docker build`; `gcloud builds submit` flows are an optional
+  convenience for building off your machine. The one exception as
+  written: `tests/e2e/build_baseline_so.sh` submits the baseline image
+  build to Cloud Build — if you don't use Google Cloud, run the
+  Dockerfile it generates with local `docker build` and push the image
+  to your own registry.
+- **GPU tiers — a Linux host with an NVIDIA GPU and 2MB hugepages.**
+  `run_e2e.sh` and `perf_regression.sh` are plain scripts and run on any
+  such host (the checkpoint store lives on hugepage-backed memory). The
+  one-shot `tests/e2e/e2e-pod.yaml` flow additionally expects a
+  pre-existing Kubernetes cluster (GKE or otherwise) with a node
+  exposing one GPU plus 2Mi hugepages, and a registry the cluster can
+  pull the images from — nothing provisions a cluster for you.
+
 ## How the unit tier works
 
 The unit tier uses three standard C++ tools. If you have not worked with
@@ -73,11 +96,10 @@ reports through the same `ctest` front end as the unit tier.
 
 Function-level coverage of two layers:
 
-- **Code added on top of upstream**: buffer-size config parsing
-  (KEP-0002), control-path resolution and advertisement round-trip
-  (GEP-0006), dump-format validation (GEP-0001), granule clamping
-  (GEP-0005), consume-once FINISH bookkeeping, region-spec parsing, and
-  wire-layout guards.
+- **Code added on top of upstream**: buffer-size config parsing,
+  control-path resolution and advertisement round-trip, dump-format
+  validation, granule clamping, consume-once FINISH bookkeeping,
+  region-spec parsing, and wire-layout guards.
 - **The upstream-baseline functions themselves**: the 2MB rounding macro,
   signal numbers and wire structs (`common_baseline_test`), the
   ShareMemComm control channel (`share_mem_comm_test`), the ShareMem
@@ -102,7 +124,8 @@ timeouts, PID-reuse refusal, version skew, and the documented exit codes
 ctest -R cr_client_integration --output-on-failure
 ```
 
-Both GPU-free tiers in one shot via Cloud Build (no image published):
+Optionally, both GPU-free tiers in one shot on Google Cloud Build (not
+required — see "What you need"; no image published):
 
 ```sh
 gcloud builds submit --config cloudbuild-test.yaml .
