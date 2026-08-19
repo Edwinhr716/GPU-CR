@@ -3,7 +3,11 @@
 #
 #   1. Build the candidate e2e image (the GPU-free suites run as a build gate)
 #      and push it to a registry your cluster can pull from:
-#        docker build -f Dockerfile.build --target e2e -t <registry>/gpucr-e2e:<tag> .
+#        docker build -f Dockerfile.build --target e2e \
+#            --build-arg SHM_SIZE_GB=5 -t <registry>/gpucr-e2e:<tag> .
+#      SHM_SIZE_GB=5 keeps a library without runtime buffer sizing inside
+#      this pod's 16Gi hugepage request (the compile-time default is
+#      25 GiB); builds that honor GPU_CR_SHM_MB may keep the default.
 #   2. Build baseline once: tests/e2e/build_baseline_so.sh
 #   3. Point the images below at your registry, then:
 #        kubectl apply -f tests/e2e/e2e-pod.yaml

@@ -11,8 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <set>
 #include <string>
-#include <vector>
 
 #include "common.h"
 #include "gtest/gtest.h"
@@ -50,20 +50,26 @@ class MmapBackendTest : public ::testing::Test {
     unsetenv("EXPORT_FILE_PATH");
   }
 
-  std::string DumpPath(int id) {
-    used_ids_.insert(used_ids_.end(), id);
+  // Pure path helpers; Track(id) registers an id's backing files for
+  // TearDown cleanup and passes the id through, so tests can register at
+  // the point of construction: ShareMem backend(Track(7)).
+  std::string DumpPath(int id) const {
     return std::string(dir_) + "/ckpt-" + std::to_string(id) + ".data";
   }
-  std::string HostPath(int id) {
+  std::string HostPath(int id) const {
     return std::string(dir_) + "/ckpt-" + std::to_string(id) + "-host.data";
+  }
+  int Track(int id) {
+    used_ids_.insert(id);
+    return id;
   }
 
   char dir_[64];
-  std::vector<int> used_ids_;
+  std::set<int> used_ids_;
 };
 
 TEST_F(MmapBackendTest, SetupInitializesDumpBufferHeader) {
-  ShareMem backend(7);
+  ShareMem backend(Track(7));
   backend.setup();
 
   void* buf = backend.get_tmp_buf();
@@ -71,11 +77,10 @@ TEST_F(MmapBackendTest, SetupInitializesDumpBufferHeader) {
   shared_mem_fs* fs = static_cast<shared_mem_fs*>(buf);
   EXPECT_EQ(fs->file_num, 0u);
   EXPECT_EQ(fs->current_offset, ROUND_UP_2MB(sizeof(shared_mem_fs)));
-  (void)DumpPath(7);  // register for cleanup
 }
 
 TEST_F(MmapBackendTest, FilesCreatedAtConfiguredSizes) {
-  ShareMem backend(3);
+  ShareMem backend(Track(3));
   backend.setup();
   ASSERT_NE(backend.get_tmp_buf(), nullptr);
 
@@ -89,7 +94,7 @@ TEST_F(MmapBackendTest, FilesCreatedAtConfiguredSizes) {
 }
 
 TEST_F(MmapBackendTest, BuffersAreWritable) {
-  ShareMem backend(5);
+  ShareMem backend(Track(5));
   backend.setup();
 
   char* dump = static_cast<char*>(backend.get_tmp_buf());
@@ -106,11 +111,10 @@ TEST_F(MmapBackendTest, BuffersAreWritable) {
   host[Config().staging_size] = 0x22;
   EXPECT_EQ(host[0], 0x11);
   EXPECT_EQ(host[Config().staging_size], 0x22);
-  (void)DumpPath(5);
 }
 
 TEST_F(MmapBackendTest, GettersAreStable) {
-  ShareMem backend(6);
+  ShareMem backend(Track(6));
   backend.setup();
   void* tmp = backend.get_tmp_buf();
   ASSERT_NE(tmp, nullptr);
@@ -118,12 +122,11 @@ TEST_F(MmapBackendTest, GettersAreStable) {
   void* host = backend.get_host_buffer();
   ASSERT_NE(host, nullptr);
   EXPECT_EQ(backend.get_host_buffer(), host);
-  (void)DumpPath(6);
 }
 
 TEST_F(MmapBackendTest, DistinctIdsGetDistinctFiles) {
-  ShareMem a(1);
-  ShareMem b(2);
+  ShareMem a(Track(1));
+  ShareMem b(Track(2));
   a.setup();
   b.setup();
   ASSERT_NE(a.get_tmp_buf(), nullptr);
@@ -133,6 +136,26 @@ TEST_F(MmapBackendTest, DistinctIdsGetDistinctFiles) {
   struct stat st;
   EXPECT_EQ(stat(DumpPath(1).c_str(), &st), 0);
   EXPECT_EQ(stat(DumpPath(2).c_str(), &st), 0);
+}
+
+// Reusing an id whose backing file holds a stale (or garbage) header must
+// re-initialize it: setup() rewrites file_num and current_offset after
+// mapping, which the restore path depends on to not read leftovers.
+TEST_F(MmapBackendTest, SetupResetsStaleHeaderOnExistingFile) {
+  int fd = open(DumpPath(Track(8)).c_str(), O_CREAT | O_RDWR, 0644);
+  ASSERT_GE(fd, 0);
+  shared_mem_fs garbage;
+  memset(&garbage, 0xa5, sizeof(garbage));
+  ASSERT_EQ(write(fd, &garbage, sizeof(garbage)),
+            static_cast<ssize_t>(sizeof(garbage)));
+  close(fd);
+
+  ShareMem backend(8);
+  backend.setup();
+  shared_mem_fs* fs = static_cast<shared_mem_fs*>(backend.get_tmp_buf());
+  ASSERT_NE(fs, nullptr);
+  EXPECT_EQ(fs->file_num, 0u);
+  EXPECT_EQ(fs->current_offset, ROUND_UP_2MB(sizeof(shared_mem_fs)));
 }
 
 // Eager setup keeps the historical fatal-exit contract when the data dir

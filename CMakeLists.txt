@@ -178,6 +178,7 @@ if(GPU_CR_BUILD_TESTS)
     )
     target_include_directories(gpu_cr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        # selective_spec_test includes coordinator/selective_spec.h
         ${CMAKE_CURRENT_SOURCE_DIR}/coordinator
     )
     target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)

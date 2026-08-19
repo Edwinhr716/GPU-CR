@@ -3,6 +3,8 @@
 #
 # Required env: CR_CLIENT, WORKLOAD, STORE (dump/staging dir).
 # Optional env: GPU_CR_CTL_PATH (tmpfs ctl dir), RUN (scratch dir).
+# GPU_CR_CTL_PATH and GPU_CR_CUDA_CHECKPOINT are honored only by
+# libraries/clients that support them; inert for the e9bbb52 baseline.
 
 RUN=${RUN:-$(mktemp -d /tmp/gpu-cr-e2e.XXXXXX)}
 SPEC="$RUN/spec"
@@ -63,7 +65,9 @@ stop_workload() {
     kill "$WL_PID" 2>/dev/null
     wait "$WL_PID" 2>/dev/null
     # hugetlbfs pages are freed only when the backing files go away: purge
-    # the per-run buffers or back-to-back runs exhaust the pool.
+    # the per-run buffers or back-to-back runs exhaust the pool. NOTE:
+    # clears every ckpt-*/control*/pid_map_* under $STORE — point STORE
+    # at a dedicated volume, not a shared store.
     rm -f "$STORE"/ckpt-* "$STORE"/control* "$STORE"/pid_map_* 2>/dev/null
     WL_PID=""
     return 0

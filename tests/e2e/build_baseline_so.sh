@@ -6,6 +6,9 @@
 # identical harness and only GPU-CR code differs.
 #
 # Usage: build_baseline_so.sh [git-ref] [image-tag] [shm-size-gb]
+# Run from a git checkout that contains the pinned commit (e.g. a clone
+# of upstream GPU-CR): the script git-archives it, and a vendored copy
+# of this tree does not carry upstream history.
 # Produces asia-southeast1-docker.pkg.dev/$PROJECT/time-slicing/gpucr-so:<tag>
 #
 # shm-size-gb defaults to 5: the baseline has no env-based sizing, so its

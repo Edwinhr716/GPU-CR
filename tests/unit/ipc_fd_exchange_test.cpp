@@ -15,6 +15,7 @@
 
 #include "gtest/gtest.h"
 
+namespace gpu_cr {
 namespace {
 
 std::string SockPath(pid_t pid) {
@@ -119,6 +120,27 @@ TEST(IpcFdExchangeTest, TransfersMultipleFdsInOneRequest) {
   unlink(path_b);
 }
 
+// The server keeps static state (socket fd, path, thread); a
+// stop-then-start cycle on the same PID must serve a fresh round trip,
+// pinning the reset a later lifecycle refactor could break.
+TEST(IpcFdExchangeTest, RestartAfterStopServesAgain) {
+  { ServerGuard first; ASSERT_EQ(first.rc, 0); }
+
+  char path[] = "/tmp/gpu-cr-fdx-restart-XXXXXX";
+  int fd = mkstemp(path);
+  ASSERT_GE(fd, 0);
+
+  ServerGuard second;
+  ASSERT_EQ(second.rc, 0);
+  int out = -1;
+  ASSERT_EQ(uds_receive_fds(getpid(), &fd, 1, &out), 1);
+  EXPECT_EQ(InodeOf(out), InodeOf(fd));
+
+  close(out);
+  close(fd);
+  unlink(path);
+}
+
 // Requesting a descriptor the peer does not hold must fail the call, not
 // hang or hand back garbage (the kernel refuses to SCM_RIGHTS a bad fd).
 TEST(IpcFdExchangeTest, InvalidPeerFdFailsCleanly) {
@@ -136,3 +158,4 @@ TEST(IpcFdExchangeTest, InvalidPeerFdFailsCleanly) {
 }
 
 }  // namespace
+}  // namespace gpu_cr

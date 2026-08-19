@@ -17,6 +17,7 @@
 #       [--baseline-client BIN] [--candidate-client BIN] \
 #       [--iters 5] [--threshold-pct 15]
 # Required env: CR_CLIENT (default client), WORKLOAD, STORE.
+# Optional env: CR_TIMEOUT (seconds per cr_client call, default 120).
 # Sizing env:  PERF_NUM_BUFFERS (default 8), PERF_BUFFER_MB (default 512).
 set -u
 HERE=$(dirname "$(readlink -f "$0")")
@@ -53,20 +54,23 @@ measure() {
     : > "$RUN/workload.stderr"
     # The baseline .so has no env-based sizing: its dump buffer is the
     # compile-time SHM_SIZE_GB, which the caller must have built large
-    # enough. The candidate takes GPU_CR_SHM_MB (a no-op for the baseline).
+    # enough. GPU_CR_SHM_MB is passed for candidates that support env
+    # sizing; libraries that predate it (the e9bbb52 baseline included)
+    # ignore it.
     start_workload "$so" \
         E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" \
-        GPU_CR_SHM_MB="$SHM_MB" "$@" || return 1
+        GPU_CR_SHM_MB="$SHM_MB" "$@" || { stop_workload; return 1; }
     local crc="env EXPORT_FILE_PATH=$STORE"
-    $crc "$client" -i -p "$WL_PID" > /dev/null 2>&1
+    $crc timeout "${CR_TIMEOUT:-120}" "$client" -i -p "$WL_PID" > /dev/null 2>&1 \
+        || { echo "$label: init failed" >&2; stop_workload; return 1; }
 
     for i in $(seq 1 "$ITERS"); do
-        $crc "$client" -c -p "$WL_PID" > /dev/null 2>&1 \
-            || { echo "$label: full ckpt iter $i failed" >&2; return 1; }
-        $crc "$client" -r -p "$WL_PID" > /dev/null 2>&1 \
-            || { echo "$label: full restore iter $i failed" >&2; return 1; }
+        $crc timeout "${CR_TIMEOUT:-120}" "$client" -c -p "$WL_PID" > /dev/null 2>&1 \
+            || { echo "$label: full ckpt iter $i failed" >&2; stop_workload; return 1; }
+        $crc timeout "${CR_TIMEOUT:-120}" "$client" -r -p "$WL_PID" > /dev/null 2>&1 \
+            || { echo "$label: full restore iter $i failed" >&2; stop_workload; return 1; }
         wl_cmd verify > /dev/null \
-            || { echo "$label: verify failed after iter $i" >&2; return 1; }
+            || { echo "$label: verify failed after iter $i" >&2; stop_workload; return 1; }
     done
     local ckpt_ms restore_ms
     ckpt_ms=$(extract_ms "$RUN/workload.stderr" "ckpt" | median)
@@ -92,14 +96,19 @@ $CAND
 EOF
 
 # Informational: candidate selective path (no e9bbb52 baseline exists).
+# Forward hook: needs a cr_client with selective support (-s); with a
+# baseline-only client the ops fail fast and both medians report -1.
 : > "$RUN/workload.stderr"
 if start_workload "$CANDIDATE_SO" \
         E2E_NUM_BUFFERS="$NUM_BUFFERS" E2E_BUFFER_MB="$BUFFER_MB" \
         GPU_CR_SHM_MB="$SHM_MB"; then
-    "$CANDIDATE_CLIENT" -i -p "$WL_PID" > /dev/null 2>&1
+    env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" \
+        "$CANDIDATE_CLIENT" -i -p "$WL_PID" > /dev/null 2>&1
     for i in $(seq 1 "$ITERS"); do
-        env EXPORT_FILE_PATH="$STORE" "$CANDIDATE_CLIENT" -c -p "$WL_PID" -s "$WL_REGIONS" > /dev/null 2>&1
-        env EXPORT_FILE_PATH="$STORE" "$CANDIDATE_CLIENT" -r -p "$WL_PID" -s "$WL_REGIONS" > /dev/null 2>&1
+        env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" \
+            "$CANDIDATE_CLIENT" -c -p "$WL_PID" -s "$WL_REGIONS" > /dev/null 2>&1
+        env EXPORT_FILE_PATH="$STORE" timeout "${CR_TIMEOUT:-120}" \
+            "$CANDIDATE_CLIENT" -r -p "$WL_PID" -s "$WL_REGIONS" > /dev/null 2>&1
     done
     SEL_CKPT=$(extract_ms "$RUN/workload.stderr" "selective ckpt" | median)
     SEL_RESTORE=$(extract_ms "$RUN/workload.stderr" "selective restore" | median)

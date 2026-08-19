@@ -5,7 +5,7 @@
 #
 # Stages:
 #   builder  compiles everything and (RUN_TESTS=1, default) runs the
-#            GPU-free unit + integration suites — a red suite fails the build
+#            GPU-free test suites (ctest) — a red suite fails the build
 #   e2e      carries the CUDA runtime, binaries and e2e/perf scripts for
 #            running tests/e2e/ on a GPU node
 #   (final)  minimal artifact carrier: vGPU-NVIDIA.so + cr_client

@@ -33,6 +33,14 @@ TEST(RoundUp2MBTest, Idempotent) {
   EXPECT_EQ(ROUND_UP_2MB(once), once);
 }
 
+// The macro's mask is a sign-extended int; a rewrite to an unsigned
+// 32-bit mask would zero-extend and truncate every multi-GiB size
+// (SHM_SIZE defaults to 25 GiB) while all sub-4GiB cases keep passing.
+TEST(RoundUp2MBTest, LargeValuesKeepFullWidth) {
+  EXPECT_EQ(ROUND_UP_2MB(25UL << 30), 25UL << 30);
+  EXPECT_EQ(ROUND_UP_2MB((25UL << 30) + 1), (25UL << 30) + (2UL << 20));
+}
+
 // The VMM mapping granule and the hugepage size are the same 2MB constant;
 // ROUND_UP_2MB and GranuleClampLen must agree on where boundaries are.
 TEST(HugePageGeometryTest, GranuleMatchesHugePageSize) {
@@ -46,18 +54,32 @@ TEST(SignalControlsLayoutTest, SignalWordIsFirst) {
   EXPECT_EQ(offsetof(signal_controls, signal), 0u);
 }
 
-// The dump filesystem header is reserved at ROUND_UP_2MB(sizeof) — it must
-// actually fit there, and the first data extent must start 2MB-aligned.
-TEST(SharedMemFsTest, HeaderFitsReservedExtent) {
-  size_t first_data_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
-  EXPECT_GE(first_data_offset, sizeof(shared_mem_fs));
-  EXPECT_EQ(first_data_offset % kVmmGranuleSize, 0u);
+// The dump header is reserved exactly one 2MB extent at the front of the
+// buffer. Growing files[] past one hugepage would silently shift every
+// data extent, so pin both the fit and the exact reserved size.
+TEST(SharedMemFsTest, HeaderFitsWithinOneHugepageExtent) {
+  EXPECT_LE(sizeof(shared_mem_fs), static_cast<size_t>(HUGE_PAGE_SIZE));
+  EXPECT_EQ(ROUND_UP_2MB(sizeof(shared_mem_fs)),
+            static_cast<size_t>(HUGE_PAGE_SIZE));
 }
 
-TEST(SharedMemFsTest, FileTableHoldsMaxFileNumEntries) {
-  shared_mem_fs fs;
-  EXPECT_EQ(sizeof(fs.files) / sizeof(fs.files[0]),
-            static_cast<size_t>(MAX_FILE_NUM));
+// shared_mem_file / shared_mem_fs are the persisted dump-header layout,
+// shared between cr_client and the .so through the same mapping: pin the
+// exact x86-64 offsets and sizes so an added/reordered field (or a
+// changed MAX_FILE_NUM) fails here instead of corrupting dumps.
+TEST(SharedMemFsTest, FileEntryLayoutIsPinned) {
+  EXPECT_EQ(offsetof(shared_mem_file, ptr), 0u);
+  EXPECT_EQ(offsetof(shared_mem_file, start_offset), 8u);
+  EXPECT_EQ(offsetof(shared_mem_file, size), 16u);
+  EXPECT_EQ(sizeof(shared_mem_file), 24u);
+}
+
+TEST(SharedMemFsTest, HeaderLayoutIsPinned) {
+  EXPECT_EQ(offsetof(shared_mem_fs, file_num), 0u);
+  EXPECT_EQ(offsetof(shared_mem_fs, current_offset), 8u);
+  EXPECT_EQ(offsetof(shared_mem_fs, files), 16u);
+  EXPECT_EQ(static_cast<size_t>(MAX_FILE_NUM), 4096u);
+  EXPECT_EQ(sizeof(shared_mem_fs), 16u + 4096u * 24u);  // 98320
 }
 
 // The six C/R signals must be pairwise distinct or an op would alias

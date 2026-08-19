@@ -14,7 +14,8 @@
 #
 # Required env: CR_CLIENT, WORKLOAD, VGPU_SO, STORE.
 # Optional env: GPU_CR_CTL_PATH, E2E_NUM_BUFFERS, E2E_BUFFER_MB,
-#               GPU_CR_SHM_MB (defaults to a size fitting the buffers).
+#               GPU_CR_SHM_MB (defaults to a size fitting the buffers),
+#               CR_TIMEOUT (seconds per cr_client call, default 120).
 set -u
 HERE=$(dirname "$(readlink -f "$0")")
 . "$HERE/e2e_lib.sh"
@@ -33,7 +34,7 @@ gate() {
 }
 cr() { env EXPORT_FILE_PATH="$STORE" \
           ${GPU_CR_CTL_PATH:+GPU_CR_CTL_PATH="$GPU_CR_CTL_PATH"} \
-          "$CR_CLIENT" "$@"; }
+          timeout "${CR_TIMEOUT:-120}" "$CR_CLIENT" "$@"; }
 
 trap 'stop_workload' EXIT
 if [ "${E2E_FULL_TOGGLE:-0}" != "1" ]; then stub_cuda_checkpoint; fi
