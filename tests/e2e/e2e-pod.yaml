@@ -38,6 +38,8 @@ spec:
     image: asia-southeast1-docker.pkg.dev/PROJECT_ID/time-slicing/gpucr-so:baseline-e9bbb52
     imagePullPolicy: Always
     command: [sh, -c, "cp /vGPU-NVIDIA.so /baseline/ && cp /cr_client /baseline/"]
+    securityContext:
+      allowPrivilegeEscalation: false
     volumeMounts:
     - {name: baseline, mountPath: /baseline}
   containers:
@@ -64,6 +66,7 @@ spec:
     - {name: PERF_NUM_BUFFERS, value: "8"}
     - {name: PERF_BUFFER_MB, value: "512"}
     securityContext:
+      allowPrivilegeEscalation: false
       capabilities:
         add: [SYS_PTRACE]
     resources:

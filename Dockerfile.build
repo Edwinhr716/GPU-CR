@@ -29,7 +29,8 @@ RUN cd /tmp/GPU-CR && \
         make -j$(nproc) && \
         ctest --output-on-failure; \
     else \
-        cmake -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB=${SHM_SIZE_GB} .. && \
+        cmake -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB=${SHM_SIZE_GB} \
+              -DGPU_CR_BUILD_E2E=ON .. && \
         make -j$(nproc); \
     fi
 
