@@ -55,10 +55,10 @@ TEST(SignalControlsLayoutTest, SignalWordIsFirst) {
 }
 
 // The dump header is reserved exactly one 2MB extent at the front of the
-// buffer. Growing files[] past one hugepage would silently shift every
-// data extent, so pin both the fit and the exact reserved size.
+// buffer; growing files[] past one hugepage would silently shift every
+// data extent. The equality also implies the header fits (round-up never
+// shrinks a value), and RoundUp2MBTest pins the macro itself.
 TEST(SharedMemFsTest, HeaderFitsWithinOneHugepageExtent) {
-  EXPECT_LE(sizeof(shared_mem_fs), static_cast<size_t>(HUGE_PAGE_SIZE));
   EXPECT_EQ(ROUND_UP_2MB(sizeof(shared_mem_fs)),
             static_cast<size_t>(HUGE_PAGE_SIZE));
 }
