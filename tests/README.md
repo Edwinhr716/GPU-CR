@@ -118,7 +118,7 @@ against `fake_workload`, a GPU-free stand-in for the vGPU.so side that
 reuses the production control-channel code (ShareMemComm, advertisement
 writer, FINISH bookkeeping, dump validator). Covers ctl and legacy modes,
 destination-path checkpoint/restore, torn-dump refusal, op_status
-propagation (including the "never toggle cuda-checkpoint on failure" gate),
+propagation (including the "never freeze after a failed checkpoint" gate),
 timeouts, PID-reuse refusal, version skew, and the documented exit codes
 (0 OK / 1 usage / 2 op failed / 3 refused / 4 timeout).
 

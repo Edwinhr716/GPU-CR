@@ -522,10 +522,10 @@ int main(int argc, char* argv[]) {
         printf("Process internal restoration finished.\n");
         printf("Restoring done\n");
 #else
-        comm->send_msg(RESTORE_MSG);
-        kill(pid, CR_RESTORE_SIGNAL);
-        if (!WaitFinished(comm)) exit(kExitTimeout);
-        CheckFullResult(comm, "restore");
+        // Upstream ordering: thaw first, then drive the in-process restore.
+        // The restore handler runs inside the target and needs a live CUDA
+        // context; signaling a still-checkpointed process would leave the
+        // handler blocked on its first driver call.
         std::string bin_path = get_cuda_checkpoint_path();
         auto t0 = std::chrono::high_resolution_clock::now();
         if (!buffer_only)
@@ -534,8 +534,8 @@ int main(int argc, char* argv[]) {
             perror("toggle spawn");
             exit(EXIT_FAILURE);
         }
-        // A failed toggle leaves the process frozen with its VRAM already
-        // rewritten — surface it, never report success.
+        // A failed thaw leaves the process checkpointed — abort before
+        // kill() rather than wedge it mid-restore.
         if (ret != 0) {
             fprintf(stderr, "Error: '%s --toggle --pid %d' exited with status %d\n",
                     bin_path.c_str(), pid, ret);
@@ -543,6 +543,10 @@ int main(int argc, char* argv[]) {
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         printf("cuda-checkpoint restore time: %.3f s\n", std::chrono::duration<double>(t1 - t0).count());
+        comm->send_msg(RESTORE_MSG);
+        kill(pid, CR_RESTORE_SIGNAL);
+        if (!WaitFinished(comm)) exit(kExitTimeout);
+        CheckFullResult(comm, "restore");
         printf("Restoring done\n");
 #endif
     }

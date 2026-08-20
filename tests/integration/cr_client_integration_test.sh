@@ -118,8 +118,12 @@ check "torn dump: restore refused"   2 env $CTL_ENV "$CR_CLIENT" -r -p "$FAKE_PI
 start_fake $CTL_ENV FAKE_OP_STATUS=28    # ENOSPC
 check "op_status: selective ckpt surfaces failure" 2 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/dump.bin"
 check "op_status: full ckpt fails cleanly" 2 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID"
+expect_no_file "op_status: NOT frozen after a failed ckpt" "$TOGGLE_MARKER"
+# Restore thaws before the op outcome is known (upstream ordering: the
+# in-process handler needs a live CUDA context), so a failed restore
+# still exits 2 but the toggle has already run.
 check "op_status: full restore fails cleanly" 2 env $CTL_ENV "$CR_CLIENT" -r -p "$FAKE_PID"
-expect_no_file "op_status: cuda-checkpoint NOT toggled on failure" "$TOGGLE_MARKER"
+expect_file "op_status: restore thawed before the failed op" "$TOGGLE_MARKER"
 
 # --- timeout ----------------------------------------------------------------
 start_fake $CTL_ENV FAKE_NO_FINISH=1
