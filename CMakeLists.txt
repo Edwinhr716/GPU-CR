@@ -139,6 +139,8 @@ target_compile_options(multi_cr_client PRIVATE -O3 -g)
 #                              dump-format, granule-clamp and region-spec code,
 #                              plus the upstream-baseline control channel,
 #                              buffer mapping, fd exchange and memcpy_multi
+#   gpu_cr_deferred_tests    — deferred dump-buffer mode (GPU_CR_SHM_MB=0);
+#                              its own process because Config() is cached
 #   fake_workload            — GPU-free stand-in for the vGPU.so side of the
 #                              control channel
 #   cr_client_integration    — drives the real cr_client binary against
@@ -183,6 +185,20 @@ if(GPU_CR_BUILD_TESTS)
     )
     target_link_libraries(gpu_cr_unit_tests PRIVATE GTest::gtest_main pthread)
     add_test(NAME unit COMMAND gpu_cr_unit_tests)
+
+    # Deferred dump-buffer mode needs its own process: Config() is a
+    # process-cached singleton, so GPU_CR_SHM_MB=0 cannot coexist with the
+    # eager-mode suite above.
+    add_executable(gpu_cr_deferred_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/mmap_backend_deferred_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mmap_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_cr_config.cpp
+    )
+    target_include_directories(gpu_cr_deferred_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(gpu_cr_deferred_tests PRIVATE GTest::gtest_main pthread)
+    add_test(NAME unit_deferred COMMAND gpu_cr_deferred_tests)
 
     add_executable(fake_workload
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/fake_workload.cpp

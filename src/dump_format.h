@@ -11,7 +11,6 @@
 // exercise them without a GPU.
 
 #include <stdint.h>
-#include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -24,9 +23,12 @@ namespace gpu_cr {
 inline bool DumpHeaderPlausible(uint64_t file_num, uint64_t current_offset,
                                 uint64_t total_size) {
   const uint64_t header_size = ROUND_UP_2MB(sizeof(shared_mem_fs));
+  // The subtraction form (not current_offset + sizeof(DumpCommit)) keeps a
+  // header-supplied offset near UINT64_MAX from wrapping past the bound.
   return file_num > 0 && file_num < MAX_FILE_NUM &&
+         total_size >= sizeof(DumpCommit) &&
          current_offset >= header_size &&
-         current_offset + sizeof(DumpCommit) <= total_size;
+         current_offset <= total_size - sizeof(DumpCommit);
 }
 
 // Validates a whole dump file through an open fd using pread(2) — no

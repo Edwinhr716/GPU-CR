@@ -25,6 +25,8 @@ ShareMemComm::ShareMemComm(pid_t pid) : Comm(pid), pid(pid) {
 }
 
 ShareMemComm::~ShareMemComm() {
+    // Also releases any flock a caller took for the op duration.
+    if (fd_control >= 0) close(fd_control);
 }
 
 void ShareMemComm::setup() {

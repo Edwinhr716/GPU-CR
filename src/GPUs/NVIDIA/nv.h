@@ -11,6 +11,9 @@ private:
     CUdevice device_;
     CUcontext context_;
     bool cuda_initialized_;
+    // Context pushed by the last successful pushContext(), cleared by its
+    // matching popContext(). Single slot: nested pushes are unsupported.
+    CUcontext pushed_context_;
     
     void ensureCudaInitialized();
     

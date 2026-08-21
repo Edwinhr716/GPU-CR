@@ -180,6 +180,25 @@ static void* open_worker_shm(int cr_id) {
         return nullptr;
     }
 
+    // The worker ftruncate'd this file to its real (env-sized) buffer, so
+    // fstat's st_size is the authoritative extent — never OUR SHM_SIZE,
+    // which may disagree across pods or rolling restarts. Refuse a file
+    // smaller than the header window here rather than SIGBUS on first
+    // access to a torn or foreign file.
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "[SHM] ERROR: fstat(%s) failed: %s\n", shm_path, strerror(errno));
+        close(fd);
+        return nullptr;
+    }
+    if (st.st_size < (off_t)ROUND_UP_2MB(sizeof(shared_mem_fs))) {
+        fprintf(stderr, "[SHM] ERROR: %s is %lld bytes, smaller than the %zu-byte header window\n",
+                shm_path, (long long)st.st_size,
+                (size_t)ROUND_UP_2MB(sizeof(shared_mem_fs)));
+        close(fd);
+        return nullptr;
+    }
+
     // Map only the header window: the IPC scratch blocks (get_my_block /
     // get_peer_block) live inside ROUND_UP_2MB(sizeof(shared_mem_fs)), and
     // mapping the worker's full buffer at OUR compile-time SHM_SIZE was the

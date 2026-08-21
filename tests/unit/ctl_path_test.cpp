@@ -65,6 +65,15 @@ TEST_F(CtlPathTest, CtlDirNonTmpfsFallsBackToLegacy) {
   EXPECT_FALSE(ctl_mode);
 }
 
+// Empty means "unset", same as EXPORT_FILE_PATH — silent legacy, no
+// misconfiguration warning.
+TEST_F(CtlPathTest, EmptyCtlPathTreatedAsUnset) {
+  setenv("GPU_CR_CTL_PATH", "", 1);
+  bool ctl_mode = true;
+  EXPECT_STREQ(CtlDir(&ctl_mode), "/mnt/huge-ckpt");
+  EXPECT_FALSE(ctl_mode);
+}
+
 TEST_F(CtlPathTest, CtlDirMissingPathFallsBackToLegacy) {
   setenv("GPU_CR_CTL_PATH", "/nonexistent-gpu-cr-test-dir", 1);
   bool ctl_mode = true;
@@ -98,6 +107,13 @@ TEST_F(CtlPathTest, ParseStarttimeRejectsGarbage) {
   EXPECT_EQ(ParseStarttimeFromStat(""), -1);
 }
 
+// A non-numeric field 22 is -1, not a plausible-looking 0.
+TEST_F(CtlPathTest, ParseStarttimeRejectsNonNumericField) {
+  const char* line =
+      "7 (proc) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 zzz 555";
+  EXPECT_EQ(ParseStarttimeFromStat(line), -1);
+}
+
 TEST_F(CtlPathTest, ProcStarttimeOfSelfIsPositive) {
   EXPECT_GT(ProcStarttime(getpid()), 0);
 }
@@ -129,6 +145,11 @@ TEST_F(CtlPathTest, ParseAdvertisementDefaultsWhenFieldsMissing) {
   EXPECT_EQ(adv.proto, 2);
   EXPECT_EQ(adv.starttime, -1);
   EXPECT_STREQ(adv.ctl, "");
+}
+
+TEST_F(CtlPathTest, WriteAdvertisementFailsOnMissingDir) {
+  EXPECT_FALSE(WriteAdvertisement("/nonexistent-gpu-cr-test-dir", getpid(),
+                                  8192, 1024, false));
 }
 
 TEST_F(CtlPathTest, WriteAdvertisementRoundTrip) {

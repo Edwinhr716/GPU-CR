@@ -53,6 +53,9 @@ rm -f "$DUMP"
 gate "G2 dest-path selective ckpt" cr -c -p "$WL_PID" -s "$WL_REGIONS" -o "$DUMP"
 gate "G3 dest-path selective restore" cr -r -p "$WL_PID" -s "$WL_REGIONS" -o "$DUMP"
 gate "G4 verify after dest-path restore" wl_cmd verify
+# G4 was the dump's last consumer; on a hugetlbfs STORE the file pins its
+# pages until removed.
+rm -f "$DUMP"
 
 gate "G5a buffer-path selective ckpt" cr -c -p "$WL_PID" -s "$WL_REGIONS"
 gate "G5b buffer-path selective restore" cr -r -p "$WL_PID" -s "$WL_REGIONS"

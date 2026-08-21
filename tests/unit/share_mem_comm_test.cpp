@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 
+#include "ctl_path.h"
 #include "gtest/gtest.h"
 
 namespace gpu_cr {
@@ -61,6 +62,33 @@ TEST_F(ShareMemCommTest, SetupCreatesControlFile) {
   EXPECT_EQ(st.st_size, static_cast<off_t>(HUGE_PAGE_SIZE));
   // fchmod(0777): agent container and workload run as different users.
   EXPECT_EQ(st.st_mode & 07777, 0777u);
+}
+
+// Ctl mode: a tmpfs GPU_CR_CTL_PATH moves the control file off the data
+// dir, and setup() preallocates the stored extent so a full ctl tmpfs
+// fails here instead of as SIGBUS at the first store.
+TEST_F(ShareMemCommTest, SetupUsesCtlDirWhenTmpfs) {
+  if (!DirIsTmpfs("/dev/shm")) GTEST_SKIP() << "/dev/shm is not tmpfs here";
+  char ctl_dir[] = "/dev/shm/gpu-cr-ctl-XXXXXX";
+  ASSERT_NE(mkdtemp(ctl_dir), nullptr);
+  setenv("GPU_CR_CTL_PATH", ctl_dir, 1);
+
+  ShareMemComm comm(666);
+  comm.setup();
+
+  std::string ctl_control = std::string(ctl_dir) + "/control-666";
+  struct stat st;
+  ASSERT_EQ(stat(ctl_control.c_str(), &st), 0);
+  EXPECT_EQ(st.st_size, static_cast<off_t>(HUGE_PAGE_SIZE));
+  // posix_fallocate pinned: at least the stored extent is backed.
+  EXPECT_GE(static_cast<size_t>(st.st_blocks) * 512,
+            RoundUp4K(sizeof(signal_controls)));
+  // The data dir must NOT grow a control file in ctl mode.
+  EXPECT_NE(stat(ControlPath(666).c_str(), &st), 0);
+
+  unlink(ctl_control.c_str());
+  rmdir(ctl_dir);
+  unsetenv("GPU_CR_CTL_PATH");
 }
 
 // A fresh (zero-filled) mapping reads FINISH: cr_client relies on an idle

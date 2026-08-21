@@ -12,6 +12,12 @@
 namespace gpu_cr {
 namespace {
 
+TEST(GranuleClampLenTest, ZeroLengthStaysZero) {
+  // A clamp must never turn an empty copy into a 2MB one.
+  EXPECT_EQ(GranuleClampLen(0, 0), 0u);
+  EXPECT_EQ(GranuleClampLen(kVmmGranuleSize - 4, 0), 0u);
+}
+
 TEST(GranuleClampLenTest, ShortCopyFromAlignedStartUnclamped) {
   EXPECT_EQ(GranuleClampLen(0, 4096), 4096u);
 }
@@ -79,11 +85,16 @@ TEST(FinishOpControlsTest, ConsumesRequestExtension) {
   EXPECT_EQ(c.selective_req.num_regions, 2u);
 }
 
+// Bits FINISH does not own must survive it: pre-set a foreign bit with
+// kCrCapDestPath clear and check FINISH keeps the former while OR-ing in
+// the latter.
 TEST(FinishOpControlsTest, CapabilityPersistsAcrossOps) {
+  constexpr uint32_t kForeignCap = 1u << 1;
   signal_controls c;
   memset(&c, 0, sizeof(c));
-  c.capability = kCrCapDestPath;
+  c.capability = kForeignCap;
   FinishOpControls(&c, EIO);
+  EXPECT_EQ(c.capability & kForeignCap, kForeignCap);
   EXPECT_EQ(c.capability & kCrCapDestPath, kCrCapDestPath);
 }
 
@@ -93,6 +104,29 @@ TEST(WireLayoutTest, V1PrefixOffsetsUnchanged) {
   EXPECT_EQ(offsetof(SelectiveCrRequest, num_regions), 0u);
   EXPECT_EQ(offsetof(SelectiveCrRequest, regions), 8u);
   EXPECT_EQ(offsetof(signal_controls, selective_req), 8u);
+}
+
+// The appended v2 fields are what a separately-built cr_client and .so
+// agree on through the shared mapping: pin the exact x86-64 offsets and
+// sizes (style of common_baseline_test.cpp) so an added/reordered field —
+// or a changed kMaxSelectiveRegions/kSelectiveCrMaxPath, which would
+// silently shift every v2 offset — fails here instead of on the wire.
+TEST(WireLayoutTest, V2ExtensionOffsetsPinned) {
+  EXPECT_EQ(kMaxSelectiveRegions, 4096u);
+  EXPECT_EQ(kSelectiveCrMaxPath, 256u);
+
+  EXPECT_EQ(offsetof(SelectiveCrRegion, ptr), 0u);
+  EXPECT_EQ(offsetof(SelectiveCrRegion, size), 8u);
+  EXPECT_EQ(sizeof(SelectiveCrRegion), 16u);
+
+  EXPECT_EQ(offsetof(SelectiveCrRequest, proto_version), 65544u);
+  EXPECT_EQ(offsetof(SelectiveCrRequest, dest_path), 65548u);
+  EXPECT_EQ(sizeof(SelectiveCrRequest), 65808u);
+
+  EXPECT_EQ(offsetof(signal_controls, capability), 65816u);
+  EXPECT_EQ(offsetof(signal_controls, proto_ack), 65820u);
+  EXPECT_EQ(offsetof(signal_controls, op_status), 65824u);
+  EXPECT_EQ(sizeof(signal_controls), 65832u);
 }
 
 }  // namespace

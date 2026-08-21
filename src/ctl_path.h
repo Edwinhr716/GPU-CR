@@ -79,7 +79,9 @@ inline long long ParseStarttimeFromStat(const char* stat_line) {
   for (char* tok = strtok_r(buf, " ", &save); tok;
        tok = strtok_r(nullptr, " ", &save), field++) {
     if (field == 22) {
-      val = atoll(tok);
+      char* end = nullptr;
+      val = strtoll(tok, &end, 10);
+      if (end == tok) val = -1;  // no digits consumed: not a stat line
       break;
     }
   }
@@ -113,8 +115,11 @@ struct Advertisement {
 };
 
 // Parses "proto=<n> starttime=<n> ctl=<path> ..." (unknown trailing keys
-// ignored). Returns false only for an empty/absent proto line; individual
-// fields keep their defaults when missing.
+// ignored). The sscanf format is an ordered prefix match: only a suffix of
+// the fields may be absent — a missing middle field stops the scan there
+// and every later field keeps its default. %511s also means the ctl path
+// must not contain whitespace. Returns false only for an empty/absent
+// proto line.
 inline bool ParseAdvertisement(const char* line, Advertisement* out) {
   if (!line || !line[0]) return false;
   return sscanf(line, "proto=%d starttime=%lld ctl=%511s", &out->proto,
@@ -129,13 +134,26 @@ inline bool WriteAdvertisement(const char* ctl_dir, pid_t pid, size_t shm_mb,
                                size_t staging_mb, bool deferred) {
   char ready_path[512];
   char content[600];
-  snprintf(ready_path, sizeof(ready_path), "%s/ctl-ready-%d", ctl_dir,
-           static_cast<int>(pid));
+  // Both snprintf results are clamped BEFORE open: a truncated advert must
+  // never be written (O_TRUNC would blank a good pre-existing one), and
+  // snprintf returns the would-be length, not the written length.
+  int path_len = snprintf(ready_path, sizeof(ready_path), "%s/ctl-ready-%d",
+                          ctl_dir, static_cast<int>(pid));
+  if (path_len < 0 || path_len >= static_cast<int>(sizeof(ready_path))) {
+    fprintf(stderr, "[vGPU] WARNING: ctl dir too long for advert path (%s)\n",
+            ctl_dir);
+    return false;
+  }
   int content_len = snprintf(
       content, sizeof(content),
       "proto=%d starttime=%lld ctl=%s shm_mb=%zu staging_mb=%zu deferred=%d\n",
       kCtlProto, ProcStarttime(pid), ctl_dir, shm_mb, staging_mb,
       deferred ? 1 : 0);
+  if (content_len < 0 || content_len >= static_cast<int>(sizeof(content))) {
+    fprintf(stderr, "[vGPU] WARNING: advert line truncated for %s; not written\n",
+            ready_path);
+    return false;
+  }
   int fd = open(ready_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
   if (fd < 0) {
     fprintf(stderr, "[vGPU] WARNING: cannot write %s (%s) — cr_client will "

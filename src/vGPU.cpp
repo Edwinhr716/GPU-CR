@@ -39,7 +39,6 @@ static void*  g_local_alloc_data_buf  = nullptr;
 static size_t g_local_alloc_data_size = 0;
 
 std::mutex fs_mutex;
-std::mutex gpu_mem_mutex;
 Comm *comm;
 Backend *backend;
 GPU *gpu;
@@ -59,6 +58,23 @@ int g_op_status = 0;
 // lives in common.h as gpu_cr::GranuleClampLen so it is unit-testable).
 static inline size_t GranuleClamp(const void* dev_ptr, size_t len) {
     return gpu_cr::GranuleClampLen(reinterpret_cast<uintptr_t>(dev_ptr), len);
+}
+
+// gpu_mem_mutex is shared with the allocation interposers (cudaMalloc/
+// cudaFree in the GPU layer). The CR signal can land on a thread that is
+// INSIDE one of those critical sections; a blocking lock here would
+// self-deadlock the process. Ops therefore acquire with a bounded
+// try-lock and fail cleanly (EBUSY) if the lock never frees — contention
+// from OTHER threads resolves well within the bound, so the common case
+// behaves exactly like the blocking lock it replaces.
+static bool LockGpuMem(std::unique_lock<std::mutex>* lk) {
+    constexpr int kAttempts = 2000;  // ~2s at 1ms per attempt
+    for (int i = 0; i < kAttempts; i++) {
+        if (lk->try_lock()) return true;
+        struct timespec ts = {0, 1000000};  // 1ms; nanosleep is async-signal-safe
+        nanosleep(&ts, nullptr);
+    }
+    return false;
 }
 
 
@@ -85,7 +101,14 @@ double ckpt() {
     size_t des_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
 
     fs_mutex.lock();
-    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+    std::unique_lock<std::mutex> lock(gpu_mem_mutex, std::defer_lock);
+    if (!LockGpuMem(&lock)) {
+        fprintf(stderr, "[vGPU-CKPT] Error: gpu_mem_mutex busy (allocation in flight on the "
+                        "signaled thread?); failing cleanly\n");
+        g_op_status = EBUSY;
+        fs_mutex.unlock();
+        return -1;
+    }
 
     // With env-shrinkable buffers an oversized full checkpoint
     // is an operator-config away, so validate BEFORE touching fs or GPU
@@ -387,6 +410,15 @@ double ckpt_selective(const SelectiveCrRequest* req) {
             req->num_regions, getpid(), dest_path ? dest_path : "(per-PID buffer)");
     fflush(stderr);
 
+    // The request lives in a caller-writable mapping: bound it like the
+    // dump header, before any lock or open.
+    if (req->num_regions > gpu_cr::kMaxSelectiveRegions) {
+        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: num_regions %u exceeds max %u; rejecting\n",
+                req->num_regions, gpu_cr::kMaxSelectiveRegions);
+        g_op_status = EINVAL;
+        return -1;
+    }
+
     double tot_size = 0;
 
     auto time_start = std::chrono::high_resolution_clock::now();
@@ -397,7 +429,14 @@ double ckpt_selective(const SelectiveCrRequest* req) {
     size_t des_offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
 
     fs_mutex.lock();
-    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+    std::unique_lock<std::mutex> lock(gpu_mem_mutex, std::defer_lock);
+    if (!LockGpuMem(&lock)) {
+        fprintf(stderr, "[vGPU-SELECTIVE-CKPT] Error: gpu_mem_mutex busy (allocation in flight "
+                        "on the signaled thread?); failing cleanly\n");
+        g_op_status = EBUSY;
+        fs_mutex.unlock();
+        return -1;
+    }
 
     // Resolve target blocks BEFORE picking the output: with a destination
     // file the exact dump size must be known up front (only the .so knows
@@ -540,6 +579,16 @@ double ckpt_selective(const SelectiveCrRequest* req) {
 
             if (gpu->memcpyAsync(start_addr, d, cur_size, GPUMemcpyKind::DeviceToHost, stream) != 0) {
                 fprintf(stderr, "Error: memcpyAsync failed\n");
+                if (dest_path) {
+                    // Nothing has been released yet, and without a commit
+                    // marker the partial dump is detectably torn.
+                    gpu->destroyStream(stream);
+                    gpu->destroyEvent(event);
+                    g_op_status = EIO;
+                    DestClose(&dm);
+                    fs_mutex.unlock();
+                    return -1;
+                }
                 fs_mutex.unlock();
                 exit(-1);
             }
@@ -599,13 +648,15 @@ double ckpt_selective(const SelectiveCrRequest* req) {
 
     // Commit marker AFTER the last extent landed: restores refuse dumps
     // without it, so a crash anywhere above leaves a detectably-torn file.
-    // The magic is stored last so a marker is never observed half-written.
+    // The magic store is release-ordered so it lands last by construction
+    // (not just in program order) — a marker is never observed with a
+    // half-written generation.
     if (fs->current_offset + sizeof(DumpCommit) <=
             (dest_path ? dm.capacity : static_cast<size_t>(SHM_SIZE))) {
         DumpCommit* dc = reinterpret_cast<DumpCommit*>(
             reinterpret_cast<char*>(fs) + fs->current_offset);
         dc->generation = ++g_dump_generation;
-        dc->magic = gpu_cr::kDumpCommitMagic;
+        __atomic_store_n(&dc->magic, gpu_cr::kDumpCommitMagic, __ATOMIC_RELEASE);
     }
 
     fprintf(stderr, "Releasing physical GPU memory for %lu selective regions...\n", (unsigned long)fs->file_num);
@@ -647,7 +698,13 @@ double ckpt_selective(const SelectiveCrRequest* req) {
 }
 
 double restore_ptr_and_content() {
-    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+    std::unique_lock<std::mutex> lock(gpu_mem_mutex, std::defer_lock);
+    if (!LockGpuMem(&lock)) {
+        fprintf(stderr, "[vGPU-restore] Error: gpu_mem_mutex busy (allocation in flight on the "
+                        "signaled thread?); failing cleanly\n");
+        g_op_status = EBUSY;
+        return -1;
+    }
     double tot_size = 0;
 
     long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
@@ -773,7 +830,21 @@ double restore_ptr_and_content() {
 double restore_ptr_and_content_selective(const SelectiveCrRequest* req) {
     const char* dest_path = (req->proto_version >= gpu_cr::kSelectiveCrProtoV2 && req->dest_path[0] != '\0')
                                 ? req->dest_path : nullptr;
-    std::lock_guard<std::mutex> lock(gpu_mem_mutex);
+    // The request lives in a caller-writable mapping: bound it like the
+    // dump header, before any lock or open.
+    if (req->num_regions > gpu_cr::kMaxSelectiveRegions) {
+        fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: num_regions %u exceeds max %u; rejecting\n",
+                req->num_regions, gpu_cr::kMaxSelectiveRegions);
+        g_op_status = EINVAL;
+        return -1;
+    }
+    std::unique_lock<std::mutex> lock(gpu_mem_mutex, std::defer_lock);
+    if (!LockGpuMem(&lock)) {
+        fprintf(stderr, "[vGPU-SELECTIVE-RESTORE] Error: gpu_mem_mutex busy (allocation in "
+                        "flight on the signaled thread?); failing cleanly\n");
+        g_op_status = EBUSY;
+        return -1;
+    }
     double tot_size = 0;
 
     long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
@@ -1013,13 +1084,14 @@ void init_CR() {
         char id_buf[32];
         int id_len = snprintf(id_buf, sizeof(id_buf), "%d\n", id);
         ssize_t written = write(fd_map, id_buf, id_len);
+        int write_errno = errno;  // saved before close()/chmod() can clobber it
         close(fd_map);
         chmod(map_name, 0666);
         if (written == id_len)
             fprintf(stderr, "[init_CR] Written PID map: %s -> %d\n", map_name, id);
         else
             fprintf(stderr, "[init_CR] PID map write to %s failed (%s) — callers fall back to /proc/<pid>/maps\n",
-                    map_name, strerror(errno));
+                    map_name, written < 0 ? strerror(write_errno) : "short write");
     } else {
         perror("[init_CR] Failed to open PID map file for writing");
     }
@@ -1473,13 +1545,24 @@ __attribute__((constructor)) void init() {
     signal(CR_CKPT_SIGNAL, cr_signal_handler);
     signal(CR_RESTORE_SIGNAL, cr_signal_handler);
 
-    // Readiness advertisement: written HERE, in the same
-    // constructor that installs the handlers, so its existence proves the
-    // signals above are safe to send — cr_client refuses to kill() without
-    // it. starttime makes the file self-invalidating across PID reuse.
-    // Never written in legacy mode (a disk-backed dir could be shadowed by
-    // a later tmpfs mount, stranding a stale advertisement). Failures are
-    // logged, never fatal: this must not take down the workload.
+    // Multi-GPU IPC teardown/rebuild signals (replaces NCCL suspend/resume)
+    signal(CR_IPC_TEARDOWN_SIGNAL, cr_ipc_signal_handler);
+    signal(CR_IPC_REBUILD_SIGNAL, cr_ipc_signal_handler);
+
+    // Diagnostic: validate all IPC mappings on demand
+    signal(CR_IPC_VALIDATE_SIGNAL, [](int) {
+        ipc_validate_all_mappings("ON-DEMAND");
+        fflush(stderr);
+    });
+
+    // Readiness advertisement: written LAST, in the same constructor that
+    // installs the handlers, so its existence proves every handler above
+    // is in place before any coordinator can see the file — cr_client
+    // refuses to kill() without it. starttime makes the file
+    // self-invalidating across PID reuse. Never written in legacy mode (a
+    // disk-backed dir could be shadowed by a later tmpfs mount, stranding
+    // a stale advertisement). Failures are logged, never fatal: this must
+    // not take down the workload.
     {
         bool ctl_mode = false;
         const char* ctl_dir = gpu_cr::CtlDir(&ctl_mode);
@@ -1494,14 +1577,4 @@ __attribute__((constructor)) void init() {
                         ctl_dir, getpid());
         }
     }
-
-    // Multi-GPU IPC teardown/rebuild signals (replaces NCCL suspend/resume)
-    signal(CR_IPC_TEARDOWN_SIGNAL, cr_ipc_signal_handler);
-    signal(CR_IPC_REBUILD_SIGNAL, cr_ipc_signal_handler);
-
-    // Diagnostic: validate all IPC mappings on demand
-    signal(CR_IPC_VALIDATE_SIGNAL, [](int) {
-        ipc_validate_all_mappings("ON-DEMAND");
-        fflush(stderr);
-    });
 }

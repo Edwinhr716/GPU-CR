@@ -6,7 +6,6 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <assert.h>
 #include <chrono>
 #include <limits.h>
@@ -14,20 +13,6 @@
 #include <string.h>
 #include <string>
 
-// openat2 hardening for the pre-create: cr_client runs as
-// root in the agent pod against a workload-writable store, so symlink
-// swaps must not let it create/truncate arbitrary host files. Definitions
-// are local so old kernel headers still build; ENOSYS falls back to
-// openat(O_NOFOLLOW).
-#ifndef SYS_openat2
-#define SYS_openat2 437
-#endif
-#ifndef RESOLVE_NO_SYMLINKS
-#define RESOLVE_NO_SYMLINKS 0x04ULL
-#endif
-#ifndef RESOLVE_BENEATH
-#define RESOLVE_BENEATH 0x08ULL
-#endif
 #ifdef __HIP_PLATFORM_AMD__
 // AMD platform
 #else
@@ -41,14 +26,6 @@
 #include "comm/comm.h"
 
 namespace {
-
-// Mirror of the kernel's struct open_how (linux/openat2.h), local so old
-// kernel headers still build.
-struct OpenHow {
-    uint64_t flags;
-    uint64_t mode;
-    uint64_t resolve;
-};
 
 // Exit codes (consumed by the snapshot agent):
 //   0 OK, 1 usage/parse, 2 op failed (op_status or invalid dump),
@@ -109,10 +86,15 @@ int RunCudaCheckpointToggle(const std::string& bin_path, pid_t target_pid) {
     return -1;
 }
 
-}  // namespace
-
-
-namespace {
+// kill() with the result checked: a target that died between the pre-op
+// gates and the signal should fail crisply here, not burn the whole
+// FINISH timeout on a signal that never landed.
+void SignalOrDie(pid_t target_pid, int sig) {
+    if (kill(target_pid, sig) != 0) {
+        fprintf(stderr, "Error: kill(%d, %d): %s\n", target_pid, sig, strerror(errno));
+        exit(kExitRefused);
+    }
+}
 
 // Pre-creates the destination file: existence only (O_CREAT), never sizing —
 // the .so alone can compute the dump total (preloader-authoritative
@@ -139,20 +121,21 @@ bool SecurePrecreate(const char* path) {
         fprintf(stderr, "Error: cannot open destination dir %s: %s\n", dir, strerror(errno));
         return false;
     }
-    OpenHow how;
-    memset(&how, 0, sizeof(how));
-    how.flags = O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW;
-    how.mode = 0644;
-    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS;
-    long fd = syscall(SYS_openat2, dfd, base, &how, sizeof(how));
-    if (fd < 0 && errno == ENOSYS)
-        fd = openat(dfd, base, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0644);
+    // Symlink hardening: cr_client runs as root in the agent pod against a
+    // workload-writable store, so a symlink swap must not let it
+    // create/truncate arbitrary host files. `base` is a single slash-free
+    // component resolved relative to the already-opened parent, so
+    // O_NOFOLLOW closes the only traversal left — a trailing symlink fails
+    // with ELOOP (dangling included; O_CREAT does not create through one).
+    // For this shape, openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS) would
+    // add nothing.
+    int fd = openat(dfd, base, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0644);
     close(dfd);
     if (fd < 0) {
         fprintf(stderr, "Error: cannot create destination %s: %s\n", path, strerror(errno));
         return false;
     }
-    close(static_cast<int>(fd));
+    close(fd);
     return true;
 }
 
@@ -195,7 +178,10 @@ bool CheckAdvertisement(const char* ctl_dir, int pid) {
     }
     fclose(f);
     gpu_cr::Advertisement adv;
-    gpu_cr::ParseAdvertisement(buf, &adv);
+    if (!gpu_cr::ParseAdvertisement(buf, &adv)) {
+        fprintf(stderr, "Error: unparsable advertisement %s\n", path);
+        return false;
+    }
     if (adv.proto < gpu_cr::kCtlProto) {
         fprintf(stderr, "Error: advertisement proto=%d too low (need >=%d)\n", adv.proto, gpu_cr::kCtlProto);
         return false;
@@ -344,7 +330,10 @@ int main(int argc, char* argv[]) {
 
     // Pre-signal gate: never kill() a PID whose .so hasn't
     // advertised readiness in our ctl dir — covers not-loaded, env
-    // mismatch, older libraries and PID reuse in one check.
+    // mismatch, older libraries and PID reuse in one check. The
+    // gate-to-signal window is a narrow, accepted TOCTOU: the starttime
+    // check excludes reuse, and SignalOrDie fails crisply if the target
+    // vanishes inside it.
     if (ctl_mode && !CheckAdvertisement(ctl_dir, pid))
         exit(kExitRefused);
 
@@ -380,13 +369,13 @@ int main(int argc, char* argv[]) {
         exit(kExitRefused);
     }
 
-    int ret;
+    int ret = 0;
 
     if(init) {
         comm->send_msg(INIT_MSG);
-        kill(pid, CR_INIT_SIGNAL);
+        SignalOrDie(pid, CR_INIT_SIGNAL);
         if (!WaitFinished(comm)) exit(kExitTimeout);
-    }  else if(ckpt && selective_spec) {
+    } else if (ckpt && selective_spec) {
         SelectiveCrRequest req;
         memset(&req, 0, sizeof(req));
         if (!gpu_cr::ParseSelectiveRegions(selective_spec, &req)) {
@@ -406,13 +395,13 @@ int main(int argc, char* argv[]) {
         }
         comm->control->selective_req = req;
         comm->send_msg(SELECTIVE_CKPT_MSG);
-        kill(pid, CR_CKPT_SIGNAL);
+        SignalOrDie(pid, CR_CKPT_SIGNAL);
         printf("Selective dump signal sent.\n");
         if (!WaitFinished(comm)) exit(kExitTimeout);
         CheckSelectiveResult(comm, dest_path);
         if (dest_path && !ValidateDestDump(dest_path)) exit(kExitOpFailed);
         printf("Selective checkpointing done\n");
-    } else if(restore && selective_spec) {
+    } else if (restore && selective_spec) {
         SelectiveCrRequest req;
         memset(&req, 0, sizeof(req));
         if (!gpu_cr::ParseSelectiveRegions(selective_spec, &req)) {
@@ -431,14 +420,14 @@ int main(int argc, char* argv[]) {
         }
         comm->control->selective_req = req;
         comm->send_msg(SELECTIVE_RESTORE_MSG);
-        kill(pid, CR_RESTORE_SIGNAL);
+        SignalOrDie(pid, CR_RESTORE_SIGNAL);
         printf("Selective restore signal sent.\n");
         if (!WaitFinished(comm)) exit(kExitTimeout);
         CheckSelectiveResult(comm, dest_path);
         printf("Selective restore done\n");
     } else if(ckpt) {
         comm->send_msg(CKPT_MSG);
-        kill(pid, CR_CKPT_SIGNAL);
+        SignalOrDie(pid, CR_CKPT_SIGNAL);
         printf("Dump signal sent.\n");
         if (!WaitFinished(comm)) exit(kExitTimeout);
         CheckFullResult(comm, "checkpoint");
@@ -473,11 +462,21 @@ int main(int argc, char* argv[]) {
 #else
         std::string bin_path = get_cuda_checkpoint_path();
         auto t0 = std::chrono::high_resolution_clock::now();
-        if (!buffer_only)
+        if (!buffer_only) {
             ret = RunCudaCheckpointToggle(bin_path, pid);
-        if (ret < 0) {
-            perror("toggle spawn");
-            exit(EXIT_FAILURE);
+            if (ret < 0) {
+                perror("toggle spawn");
+                exit(EXIT_FAILURE);
+            }
+            // A nonzero freeze exit means the process is still running on
+            // the GPU: report op failure (the dump itself is valid) rather
+            // than let the agent believe it parked.
+            if (ret != 0) {
+                fprintf(stderr, "Error: '%s --toggle --pid %d' exited with status %d — "
+                        "dump is valid but the process was NOT frozen\n",
+                        bin_path.c_str(), pid, ret);
+                exit(kExitOpFailed);
+            }
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         printf("cuda-checkpoint checkpoint time: %.3f s\n", std::chrono::duration<double>(t1 - t0).count());
@@ -513,7 +512,7 @@ int main(int argc, char* argv[]) {
         printf("Calling GPU-CR\n");
 
         comm->send_msg(RESTORE_MSG);
-        kill(pid, CR_RESTORE_SIGNAL);
+        SignalOrDie(pid, CR_RESTORE_SIGNAL);
 
         if (!WaitFinished(comm)) exit(kExitTimeout);
         auto t2 = std::chrono::high_resolution_clock::now();
@@ -528,23 +527,24 @@ int main(int argc, char* argv[]) {
         // handler blocked on its first driver call.
         std::string bin_path = get_cuda_checkpoint_path();
         auto t0 = std::chrono::high_resolution_clock::now();
-        if (!buffer_only)
+        if (!buffer_only) {
             ret = RunCudaCheckpointToggle(bin_path, pid);
-        if (ret < 0) {
-            perror("toggle spawn");
-            exit(EXIT_FAILURE);
-        }
-        // A failed thaw leaves the process checkpointed — abort before
-        // kill() rather than wedge it mid-restore.
-        if (ret != 0) {
-            fprintf(stderr, "Error: '%s --toggle --pid %d' exited with status %d\n",
-                    bin_path.c_str(), pid, ret);
-            exit(kExitOpFailed);
+            if (ret < 0) {
+                perror("toggle spawn");
+                exit(EXIT_FAILURE);
+            }
+            // A failed thaw leaves the process checkpointed — abort before
+            // kill() rather than wedge it mid-restore.
+            if (ret != 0) {
+                fprintf(stderr, "Error: '%s --toggle --pid %d' exited with status %d\n",
+                        bin_path.c_str(), pid, ret);
+                exit(kExitOpFailed);
+            }
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         printf("cuda-checkpoint restore time: %.3f s\n", std::chrono::duration<double>(t1 - t0).count());
         comm->send_msg(RESTORE_MSG);
-        kill(pid, CR_RESTORE_SIGNAL);
+        SignalOrDie(pid, CR_RESTORE_SIGNAL);
         if (!WaitFinished(comm)) exit(kExitTimeout);
         CheckFullResult(comm, "restore");
         printf("Restoring done\n");

@@ -678,8 +678,8 @@ using cudaPeekAtLastError_fn = cudaError_t (*)();
 using cudaStreamSynchronize_fn = cudaError_t (*)(cudaStream_t);
 using cuCtxCreate_fn = CUresult (*)(CUcontext*, unsigned int, CUdevice);
 using cuCtxDestroy_fn = CUresult (*)(CUcontext);
-using cuDevicePrimaryCtxRetain_fn = CUresult (*)(CUcontext*, CUdevice);
-using cuDevicePrimaryCtxRelease_fn = CUresult (*)(CUdevice);
+// cuDevicePrimaryCtxRetain_fn / cuDevicePrimaryCtxRelease_fn are declared
+// with the context-management aliases near the top of this file.
 
 static cudaLaunchKernel_fn real_cudaLaunchKernel = nullptr;
 static cuLaunchKernel_fn real_cuLaunchKernel = nullptr;
@@ -928,6 +928,18 @@ CUresult CUDAAPI cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size,
 
 namespace {
 
+// Per-launch tracing is opt-in (GPU_CR_TRACE_LAUNCH, read once): these
+// interposers fire on every kernel launch of a serving workload, and
+// unconditional stderr writes there are a real tax. Failure results are
+// still logged unconditionally.
+bool TraceLaunches() {
+    static const bool enabled = [] {
+        const char* v = getenv("GPU_CR_TRACE_LAUNCH");
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 // Shared body for the kernel-launch hooks: PyTorch issues launches from a
 // context captured at cudaMalloc time (g_pytorch_context); when the calling
 // thread's current context differs, the launch is bracketed by a push/pop
@@ -935,22 +947,28 @@ namespace {
 template <typename Fn>
 auto LaunchInCapturedContext(const char* name, Fn&& call) -> decltype(call()) {
     CUcontext ctx = nullptr;
-    cuCtxGetCurrent(&ctx);
-    fprintf(stderr, "[HOOK] %s: current ctx=%p\n", name, ctx);
-    fflush(stderr);
+    cuCtxGetCurrent(&ctx);  // feeds the mismatch check below, not just tracing
+    if (TraceLaunches()) {
+        fprintf(stderr, "[HOOK] %s: current ctx=%p\n", name, ctx);
+        fflush(stderr);
+    }
 
     bool pushed = false;
     if (g_pytorch_context != nullptr && ctx != g_pytorch_context) {
-        fprintf(stderr, "[HOOK] %s: context mismatch (current=%p, captured=%p), pushing captured\n",
-                name, ctx, g_pytorch_context);
+        if (TraceLaunches()) {
+            fprintf(stderr, "[HOOK] %s: context mismatch (current=%p, captured=%p), pushing captured\n",
+                    name, ctx, g_pytorch_context);
+        }
         if (cuCtxPushCurrent(g_pytorch_context) == CUDA_SUCCESS) {
             pushed = true;
         }
     }
 
     auto result = call();
-    fprintf(stderr, "[HOOK] %s returned %d\n", name, static_cast<int>(result));
-    fflush(stderr);
+    if (static_cast<int>(result) != 0 || TraceLaunches()) {
+        fprintf(stderr, "[HOOK] %s returned %d\n", name, static_cast<int>(result));
+        fflush(stderr);
+    }
 
     if (pushed) {
         CUcontext popped;
@@ -1073,8 +1091,10 @@ extern "C" cudaError_t cudaPeekAtLastError() {
 }
 
 extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
-    fprintf(stderr, "[HOOK] cudaStreamSynchronize(stream=%p)\n", stream);
-    fflush(stderr);
+    if (TraceLaunches()) {
+        fprintf(stderr, "[HOOK] cudaStreamSynchronize(stream=%p)\n", stream);
+        fflush(stderr);
+    }
 
     ResolveReal(&real_cudaStreamSynchronize, "cudaStreamSynchronize");
     cudaError_t err = real_cudaStreamSynchronize ? real_cudaStreamSynchronize(stream) : cudaErrorUnknown;
@@ -1087,8 +1107,10 @@ extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
 }
 
 extern "C" cudaError_t cudaStreamSynchronize_ptsz(cudaStream_t stream) {
-    fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz(stream=%p)\n", stream);
-    fflush(stderr);
+    if (TraceLaunches()) {
+        fprintf(stderr, "[HOOK] cudaStreamSynchronize_ptsz(stream=%p)\n", stream);
+        fflush(stderr);
+    }
 
     ResolveReal(&real_cudaStreamSynchronize_ptsz, "cudaStreamSynchronize_ptsz");
     cudaError_t err = real_cudaStreamSynchronize_ptsz ? real_cudaStreamSynchronize_ptsz(stream) : cudaErrorUnknown;
@@ -2652,6 +2674,7 @@ int ipc_validate_all_mappings(const char* label) {
 
 extern "C" CUresult CUDAAPI hook_cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
     ResolveReal(&real_cuCtxCreate, "cuCtxCreate");
+    if (!real_cuCtxCreate) return CUDA_ERROR_UNKNOWN;
     CUresult res = real_cuCtxCreate(pctx, flags, dev);
     if (res == CUDA_SUCCESS) {
         fprintf(stderr, "[HOOK] cuCtxCreate created ctx=%p for dev=%d\n", *pctx, dev);
@@ -2667,11 +2690,13 @@ extern "C" CUresult CUDAAPI hook_cuCtxDestroy(CUcontext ctx) {
     fprintf(stderr, "[HOOK] cuCtxDestroy destroying ctx=%p\n", ctx);
     fflush(stderr);
     ResolveReal(&real_cuCtxDestroy, "cuCtxDestroy");
+    if (!real_cuCtxDestroy) return CUDA_ERROR_UNKNOWN;
     return real_cuCtxDestroy(ctx);
 }
 
 extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
     ResolveReal(&real_cuDevicePrimaryCtxRetain, "cuDevicePrimaryCtxRetain");
+    if (!real_cuDevicePrimaryCtxRetain) return CUDA_ERROR_UNKNOWN;
     CUresult res = real_cuDevicePrimaryCtxRetain(pctx, dev);
     if (res == CUDA_SUCCESS) {
         fprintf(stderr, "[HOOK] cuDevicePrimaryCtxRetain retained ctx=%p for dev=%d\n", *pctx, dev);
@@ -2687,5 +2712,6 @@ extern "C" CUresult CUDAAPI hook_cuDevicePrimaryCtxRelease(CUdevice dev) {
     fprintf(stderr, "[HOOK] cuDevicePrimaryCtxRelease for dev=%d\n", dev);
     fflush(stderr);
     ResolveReal(&real_cuDevicePrimaryCtxRelease, "cuDevicePrimaryCtxRelease");
+    if (!real_cuDevicePrimaryCtxRelease) return CUDA_ERROR_UNKNOWN;
     return real_cuDevicePrimaryCtxRelease(dev);
 }

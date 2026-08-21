@@ -105,6 +105,13 @@ check "ctl: full ckpt"               0 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PI
 check "ctl: full restore (stub toggle)" 0 env $CTL_ENV "$CR_CLIENT" -r -p "$FAKE_PID"
 expect_file "ctl: cuda-checkpoint toggled on success" "$TOGGLE_MARKER"
 
+# --- -b (buffer-only) never touches cuda-checkpoint --------------------------
+start_fake $CTL_ENV
+check "ctl: full ckpt -b"            0 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -b
+expect_no_file "ctl: -b ckpt did not toggle" "$TOGGLE_MARKER"
+check "ctl: full restore -b"         0 env $CTL_ENV "$CR_CLIENT" -r -p "$FAKE_PID" -b
+expect_no_file "ctl: -b restore did not toggle" "$TOGGLE_MARKER"
+
 # --- torn dump is refused post-checkpoint ----------------------------------
 start_fake $CTL_ENV FAKE_SKIP_COMMIT=1
 check "torn dump: ckpt fails validation" 2 env $CTL_ENV "$CR_CLIENT" -c -p "$FAKE_PID" -s "$REGIONS" -o "$WORK/dump.bin"

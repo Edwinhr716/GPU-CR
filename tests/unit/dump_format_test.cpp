@@ -43,6 +43,13 @@ TEST(DumpHeaderPlausibleTest, RejectsCommitMarkerPastEof) {
                                    kHeaderSize + sizeof(DumpCommit) - 1));
 }
 
+// A header-supplied offset near UINT64_MAX must not wrap
+// current_offset + sizeof(DumpCommit) back under total_size.
+TEST(DumpHeaderPlausibleTest, RejectsWrappingOffset) {
+  EXPECT_FALSE(DumpHeaderPlausible(1, UINT64_MAX - 8,
+                                   kHeaderSize + sizeof(DumpCommit)));
+}
+
 // Writes a synthetic dump: header (file_num, current_offset), one extent of
 // `extent` bytes, and (optionally) the trailing commit marker.
 class ValidateDumpFdTest : public ::testing::Test {

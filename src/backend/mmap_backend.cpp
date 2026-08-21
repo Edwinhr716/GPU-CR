@@ -57,11 +57,11 @@ void* ShareMem::map_dump_buffer(bool fatal) {
         return nullptr;
     }
     if (use_file_backend) {
-        // tmpfs/disk reserve nothing at ftruncate or mmap; without this a
-        // full store is a SIGBUS mid-dump instead of a synchronous ENOSPC
-        // here (a deliberate posture — the
-        // dump extent grows toward the configured size, so a partial
-        // fallocate would only move the fault).
+        // Reserve the full configured size up front: tmpfs/disk reserve
+        // nothing at ftruncate or mmap, so an over-committed store would
+        // SIGBUS mid-dump; full fallocate turns that into a synchronous
+        // ENOSPC here. Partial reservation would only move the fault,
+        // since the dump extent grows toward the configured size.
         int rc = posix_fallocate(fd, 0, static_cast<off_t>(size));
         if (rc != 0) {
             fprintf(stderr, "[ShareMem] posix_fallocate(%s, %zu MiB): %s\n", shm_name, size >> 20, strerror(rc));
@@ -142,11 +142,15 @@ void* ShareMem::get_tmp_buf() {
     // creates the buffer at the floor size. Non-fatal: callers must
     // null-check and fail the op cleanly (op_status) — this runs in
     // signal-handler context and must not kill the workload on ENOMEM.
-    if (tmp_buf == nullptr && gpu_cr::Config().shm_deferred) {
-        fs_mutex.lock();
+    // Every deferred-mode access to tmp_buf goes through fs_mutex
+    // (setup() never touches it in this mode); the non-deferred read
+    // stays lock-free — setup() wrote the pointer once, before any op
+    // path or handler existed.
+    if (gpu_cr::Config().shm_deferred) {
+        std::lock_guard<std::mutex> lock(fs_mutex);
         if (tmp_buf == nullptr)
             tmp_buf = map_dump_buffer(/*fatal=*/false);
-        fs_mutex.unlock();
+        return tmp_buf;
     }
     return tmp_buf;
 }

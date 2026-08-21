@@ -136,7 +136,11 @@ struct SelectiveCrRequest {
     SelectiveCrRegion regions[gpu_cr::kMaxSelectiveRegions];
     /* --- v2 extension --- */
     uint32_t proto_version;                           /* 0 = v1, 2 = v2 */
-    char     dest_path[gpu_cr::kSelectiveCrMaxPath];  /* empty = per-PID buffer */
+    /* dest_path: empty = per-PID buffer. Must be NUL-terminated; the
+     * client rejects paths >= kSelectiveCrMaxPath-1 chars before writing,
+     * and readers should treat dest_path[kSelectiveCrMaxPath-1] != '\0'
+     * as an invalid request. */
+    char     dest_path[gpu_cr::kSelectiveCrMaxPath];
 };
 
 namespace gpu_cr {
@@ -148,7 +152,8 @@ inline constexpr uint32_t kCrCapDestPath = 1u << 0;
 // Trailing commit marker for destination-file dumps: written at
 // fs->current_offset only after the last extent has landed, so a torn
 // dump is detectable. Restores from a destination file refuse dumps
-// whose marker is absent or stale.
+// whose marker is absent or has the wrong magic; generation is recorded
+// per dump and reserved for future staleness checks (not yet compared).
 inline constexpr uint64_t kDumpCommitMagic = 0x31524347u; /* "GCR1" */
 }  // namespace gpu_cr
 
@@ -176,7 +181,7 @@ inline void FinishOpControls(signal_controls* c, int32_t op_status) {
   c->op_status = op_status;
   c->proto_ack = kSelectiveCrProtoV2;
   c->selective_req.proto_version = 0;
-  memset(c->selective_req.dest_path, 0, kSelectiveCrMaxPath);
+  std::memset(c->selective_req.dest_path, 0, kSelectiveCrMaxPath);
   c->capability |= kCrCapDestPath;
 }
 }  // namespace gpu_cr
