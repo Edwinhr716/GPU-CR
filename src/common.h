@@ -14,10 +14,13 @@
 #include <sys/mman.h>  // for mmap
 #include <pthread.h>  // for mutex lock
 #include <signal.h>   // for signal handling
+#include <cstring>    // for memset
 #include <map>
 #include <utility>
 #include <atomic>
 #include <mutex>
+
+#include "gpu_cr_config.h"
 
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 #define ROUND_UP_2MB(x) (((x) + (2 * 1024 * 1024 - 1)) & ~(2 * 1024 * 1024 - 1))
@@ -52,8 +55,6 @@ constexpr size_t GranuleClampLen(uintptr_t dev_addr, size_t len) {
 #ifndef SHM_SIZE_GB
 #define SHM_SIZE_GB 25
 #endif
-
-#include "gpu_cr_config.h"
 
 namespace gpu_cr {
 inline constexpr size_t kShmDefaultBytes =

@@ -26,7 +26,7 @@ class ConfigLoadTest : public ::testing::Test {
   BufConfig Load() { return internal::Load(kShm8, kStg1); }
 };
 
-// Fleet-default rule (F1): env unset => the BUILD's default, exactly.
+// Fleet-default rule: env unset => the BUILD's default, exactly.
 TEST_F(ConfigLoadTest, UnsetEnvUsesBuildDefaults) {
   BufConfig c = Load();
   EXPECT_EQ(c.shm_size, kShm8);
@@ -45,13 +45,20 @@ TEST_F(ConfigLoadTest, ShmMbWinsOverGb) {
   EXPECT_EQ(Load().shm_size, 300UL << 20);
 }
 
-// No upper clamp (F5): values above the old 25GiB literal are honored.
+// An empty value counts as unset: MB="" must not shadow GB.
+TEST_F(ConfigLoadTest, EmptyMbFallsThroughToGb) {
+  setenv("GPU_CR_SHM_MB", "", 1);
+  setenv("GPU_CR_SHM_GB", "12", 1);
+  EXPECT_EQ(Load().shm_size, 12UL << 30);
+}
+
+// No upper clamp: values above the old 25GiB literal are honored.
 TEST_F(ConfigLoadTest, NoUpperClamp) {
   setenv("GPU_CR_SHM_GB", "40", 1);
   EXPECT_EQ(Load().shm_size, 40UL << 30);
 }
 
-// Floor (F5): below 64MiB -> default with warning, never a clamp.
+// Floor: below 64MiB -> default with warning, never a clamp.
 TEST_F(ConfigLoadTest, BelowFloorFallsBackToDefault) {
   setenv("GPU_CR_SHM_MB", "10", 1);
   BufConfig c = Load();
@@ -59,9 +66,24 @@ TEST_F(ConfigLoadTest, BelowFloorFallsBackToDefault) {
   EXPECT_FALSE(c.shm_deferred);
 }
 
+// The floor itself is accepted: 64MiB is valid, not "below 64MiB".
+TEST_F(ConfigLoadTest, ExactShmFloorAccepted) {
+  setenv("GPU_CR_SHM_MB", "64", 1);
+  EXPECT_EQ(Load().shm_size, kShmFloorBytes);
+}
+
 // Deferred mode (=0) stays special: not subsumed by the floor.
 TEST_F(ConfigLoadTest, ZeroMeansDeferredAtFloor) {
   setenv("GPU_CR_SHM_GB", "0", 1);
+  BufConfig c = Load();
+  EXPECT_TRUE(c.shm_deferred);
+  EXPECT_EQ(c.shm_size, kShmFloorBytes);
+}
+
+// The MB spelling takes the other arm of the var selection; 0 must mean
+// deferred there too.
+TEST_F(ConfigLoadTest, ShmMbZeroAlsoDeferred) {
+  setenv("GPU_CR_SHM_MB", "0", 1);
   BufConfig c = Load();
   EXPECT_TRUE(c.shm_deferred);
   EXPECT_EQ(c.shm_size, kShmFloorBytes);
@@ -76,6 +98,35 @@ TEST_F(ConfigLoadTest, UnparsableFallsBackToDefault) {
 
 TEST_F(ConfigLoadTest, NegativeFallsBackToDefault) {
   setenv("GPU_CR_SHM_GB", "-3", 1);
+  EXPECT_EQ(Load().shm_size, kShm8);
+}
+
+// Overflow is never silent. 2^34+1 GB would wrap the size_t shift to
+// exactly 1GiB and sail past the floor if unchecked.
+TEST_F(ConfigLoadTest, ShmGbShiftOverflowFallsBackToDefault) {
+  setenv("GPU_CR_SHM_GB", "17179869185", 1);
+  BufConfig c = Load();
+  EXPECT_EQ(c.shm_size, kShm8);
+  EXPECT_FALSE(c.shm_deferred);
+}
+
+// Beyond LLONG_MAX: strtoll saturates with ERANGE; must be rejected, not
+// accepted as LLONG_MAX.
+TEST_F(ConfigLoadTest, ShmGbErangeFallsBackToDefault) {
+  setenv("GPU_CR_SHM_GB", "99999999999999999999", 1);
+  EXPECT_EQ(Load().shm_size, kShm8);
+}
+
+// MB path wraps at n >= 2^44.
+TEST_F(ConfigLoadTest, ShmMbShiftOverflowFallsBackToDefault) {
+  setenv("GPU_CR_SHM_MB", "17592186044416", 1);
+  EXPECT_EQ(Load().shm_size, kShm8);
+}
+
+// MB within 2MiB-1 of SIZE_MAX>>20: the shift itself fits but the 2MiB
+// round-up would wrap. Must reject, not silently produce a tiny buffer.
+TEST_F(ConfigLoadTest, ShmMbAlignmentWrapFallsBackToDefault) {
+  setenv("GPU_CR_SHM_MB", "17592186044415", 1);
   EXPECT_EQ(Load().shm_size, kShm8);
 }
 
@@ -94,15 +145,37 @@ TEST_F(ConfigLoadTest, StagingBelowFloorFallsBackToDefault) {
   EXPECT_EQ(Load().staging_size, kStg1);
 }
 
+TEST_F(ConfigLoadTest, ExactStagingFloorAccepted) {
+  setenv("GPU_CR_STAGING_MB", "128", 1);
+  EXPECT_EQ(Load().staging_size, kStagingFloorBytes);
+}
+
+TEST_F(ConfigLoadTest, StagingAlignsUpTo2MiB) {
+  setenv("GPU_CR_STAGING_MB", "129", 1);
+  EXPECT_EQ(Load().staging_size, 130UL << 20);
+}
+
 TEST_F(ConfigLoadTest, StagingNoUpperBound) {
   setenv("GPU_CR_STAGING_MB", "2048", 1);
   EXPECT_EQ(Load().staging_size, 2048UL << 20);
 }
 
-// Legacy names: never honored (values ignored), only warned about.
-TEST_F(ConfigLoadTest, LegacyNamesIgnored) {
+TEST_F(ConfigLoadTest, StagingOverflowFallsBackToDefault) {
+  setenv("GPU_CR_STAGING_MB", "17592186044416", 1);
+  EXPECT_EQ(Load().staging_size, kStg1);
+}
+
+// Legacy names: never honored (values ignored) for either field, and the
+// warning that says so actually fires.
+TEST_F(ConfigLoadTest, LegacyNamesIgnoredAndWarned) {
   setenv("GPUCR_SHM_GB", "60", 1);
-  EXPECT_EQ(Load().shm_size, kShm8);
+  setenv("GPUCR_STAGING_MB", "999", 1);
+  testing::internal::CaptureStderr();
+  BufConfig c = Load();
+  std::string err = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(c.shm_size, kShm8);
+  EXPECT_EQ(c.staging_size, kStg1);
+  EXPECT_NE(err.find("never read by any GPU-CR version"), std::string::npos);
 }
 
 TEST_F(ConfigLoadTest, ParseNonNegativeRejectsTrailingGarbage) {
@@ -117,12 +190,14 @@ TEST_F(ConfigLoadTest, ParseNonNegativeRejectsTrailingGarbage) {
   EXPECT_FALSE(ok);
 }
 
-TEST(AlignUp2MBTest, Boundaries) {
-  constexpr size_t k2MB = 2UL << 20;
-  EXPECT_EQ(AlignUp2MB(0), 0u);
-  EXPECT_EQ(AlignUp2MB(1), k2MB);
-  EXPECT_EQ(AlignUp2MB(k2MB), k2MB);
-  EXPECT_EQ(AlignUp2MB(k2MB + 1), 2 * k2MB);
+// Pins the documented strtoll asymmetry: leading whitespace parses,
+// trailing whitespace does not.
+TEST_F(ConfigLoadTest, ParseNonNegativeStrtollFrontTolerance) {
+  bool ok = false;
+  EXPECT_EQ(internal::ParseNonNegative(" 8", &ok), 8);
+  EXPECT_TRUE(ok);
+  internal::ParseNonNegative("8 ", &ok);
+  EXPECT_FALSE(ok);
 }
 
 }  // namespace
